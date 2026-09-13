@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #1a1a2e;
+    padding: 12px;
+}
+.card {
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    width: 380px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+.badge-bar {
+    padding: 10px 16px 0;
+}
+.live-badge {
+    display: inline-block;
+    background: #fe2c55;
+    color: #fff;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+    animation: pulse 1.5s ease-in-out infinite;
+}
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+.offline-badge {
+    display: inline-block;
+    background: #999;
+    color: #fff;
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+}
+.header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+}
+.avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid #fe2c55;
+    flex-shrink: 0;
+}
+.header-info { flex: 1; min-width: 0; }
+.nickname {
+    font-size: 15px;
+    font-weight: 600;
+    color: #1a1a2e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.tag {
+    font-size: 11px;
+    color: #999;
+}
+.live-title {
+    font-size: 14px;
+    color: #333;
+    line-height: 1.4;
+    padding: 0 16px 10px;
+}
+.url {
+    font-size: 11px;
+    color: #aaa;
+    padding: 0 16px 14px;
+    word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="card">
+    <div class="badge-bar"><span class="{{ badge_class }}">{{ badge_text }}</span></div>
+    <div class="header">
+        <img class="avatar" src="{{ avatar }}" alt="avatar" onerror="this.style.display='none'">
+        <div class="header-info">
+            <div class="nickname">{{ nickname }}</div>
+            <div class="tag">抖音直播</div>
+        </div>
+    </div>
+    <div class="live-title">{{ title }}</div>
+    <div class="url">{{ url }}</div>
+</div>
+</body>
+</html>

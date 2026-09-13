@@ -1,0 +1,52 @@
+{
+    "douyin_cookie": {
+        "description": "抖音网页版 Cookie（从 www.douyin.com 获取）",
+        "type": "string",
+        "hint": "登录抖音网页版后，从浏览器开发者工具中复制完整 Cookie 字符串",
+        "default": ""
+    },
+    "douyin_live_cookie": {
+        "description": "抖音 Cookie 备用项（可不填，留空时回退使用 douyin_cookie）",
+        "type": "string",
+        "hint": "amagi 统一使用 douyin_cookie；若 douyin_cookie 未填则使用此项",
+        "default": ""
+    },
+    "poll_interval": {
+        "description": "监控轮询间隔（秒），最小 10 秒，建议 60 秒以上避免风控",
+        "type": "int",
+        "default": 60,
+        "minimum": 10
+    },
+    "enable_live_monitor": {
+        "description": "是否启用直播间上下播监控",
+        "type": "bool",
+        "default": true
+    },
+    "amagi_port": {
+        "description": "amagi 桥接服务监听端口（127.0.0.1）。多个 AstrBot/插件实例并存时需错开",
+        "type": "int",
+        "default": 48211,
+        "minimum": 1024,
+        "maximum": 65535
+    },
+    "amagi_dir": {
+        "description": "amagi 仓库目录（默认插件目录下 amagi/，一般无需修改）",
+        "type": "string",
+        "default": ""
+    },
+    "node_path": {
+        "description": "node 可执行文件路径（留空自动从 PATH 查找，一般无需修改）",
+        "type": "string",
+        "default": ""
+    },
+    "pnpm_path": {
+        "description": "pnpm 可执行文件路径（留空自动从 PATH 查找，一般无需修改）",
+        "type": "string",
+        "default": ""
+    },
+    "rai": {
+        "description": "是否启用图片渲染模式（需要 AstrBot HTML 渲染支持）",
+        "type": "bool",
+        "default": false
+    }
+}
