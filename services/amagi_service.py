@@ -2,14 +2,24 @@
 amagi 桥接服务管理 (Python 侧)
 
 职责:
-  1. 定位并(按需)构建插件目录下的 amagi 子模块
+  1. 定位 amagi 运行时; 缺失时用 npm 自动安装官方包 @ikenxuan/amagi
   2. 以常驻 Node 子进程方式启动 amagi_bridge/server.mjs (amagi 官方 HTTP 服务)
   3. 提供健康检查 / HTTP JSON 请求 / 重启 / 停止 / 状态查询
 
+关于 amagi 运行时的获取方式 (不再使用 git 子模块):
+  官方包 @ikenxuan/amagi 发布到 npm 时已内置构建产物 (dist/*),
+  因此只需 `npm install` 即可, 无需 pnpm / 无需本地 build。
+  AstrBot 通过 WebUI 安装插件时不会拉取 git 子模块, 这正是旧方案
+  `amagi/` 目录为空的原因, 现改为运行时自动安装, 从根上避免该问题。
+
 约定:
-  - amagi 子模块目录: <plugin_dir>/amagi
-  - 桥接脚本:        <plugin_dir>/amagi_bridge/server.mjs
-  - 桥接日志:        写入 AstrBot 数据目录下的 amagi_bridge/ 文件夹
+  - amagi 运行时目录: <plugin_dir>/.amagi  (可用 amagi_dir 配置覆盖)
+  - 识别三种目录布局 (按优先级):
+      1) 完整仓库:      <dir>/packages/core/dist/default/index.mjs
+      2) npm 安装:      <dir>/node_modules/@ikenxuan/amagi/dist/default/index.mjs
+      3) 裸包目录:      <dir>/dist/default/index.mjs
+  - 桥接脚本:          <plugin_dir>/amagi_bridge/server.mjs
+  - 桥接日志:          写入 AstrBot 数据目录下的 amagi_bridge/ 文件夹
   - HTTP 请求走 amagi 自带的 /api/douyin/* 路由, 响应包裹格式:
       {"success": true,  "code": 200, "message": "...", "data": {...}, ...}
       {"success": false, "code": 400, "message": "...", "error": {...}, ...}
@@ -29,11 +39,32 @@ import requests
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
-# amagi 构建产物入口 (tsdown 输出)
-_DIST_CANDIDATES = (
+# amagi 构建产物入口候选 (相对 amagi_dir, 按优先级排列)
+_ENTRY_REL_CANDIDATES = (
+    # 1) 完整仓库布局 (git clone 源码后本地构建)
     Path("packages", "core", "dist", "default", "index.mjs"),
     Path("packages", "core", "dist", "default", "index.cjs"),
+    # 2) npm 安装布局 (npm install @ikenxuan/amagi)
+    Path("node_modules", "@ikenxuan", "amagi", "dist", "default", "index.mjs"),
+    Path("node_modules", "@ikenxuan", "amagi", "dist", "default", "index.cjs"),
+    # 3) 裸包目录布局 (解压官方 tarball 到该目录)
+    Path("dist", "default", "index.mjs"),
+    Path("dist", "default", "index.cjs"),
 )
+
+# npm 包名与默认版本 (版本与 amagi 6.x 的 dist 入口结构对应)
+_AMAGI_PKG = "@ikenxuan/amagi"
+_DEFAULT_AMAGI_VERSION = "6.6.0"
+# 默认 registry: 国内可直连的 npmmirror (官方源在国内常被阻断)
+_DEFAULT_REGISTRY = "https://registry.npmmirror.com"
+
+# 运行时目录下自动生成的 package.json (npm install 需要一个工程根)
+_RUNTIME_PKG_JSON = {
+    "name": "amagi-runtime",
+    "private": True,
+    "version": "1.0.0",
+    "description": "该目录由 astrbot_plugin_amagi_douyin_push 自动生成, 用于存放 amagi 运行时",
+}
 
 # 桥接进程就绪后 stdout 输出的固定行, 用于校验
 _READY_PREFIX = "[amagi-bridge] ready"
@@ -52,36 +83,67 @@ class AmagiAPIError(AmagiError):
     """amagi 返回的业务错误 (含 code/message)"""
 
 
+def _candidate_bin_dirs() -> list:
+    """常见 Node.js 安装目录 (PATH 未生效时兜底, 例如 AstrBot 由服务方式启动)"""
+    if os.name != "nt":
+        return []
+    dirs = []
+    for env_key, tail in (
+        ("ProgramFiles", ("nodejs",)),
+        ("ProgramFiles(x86)", ("nodejs",)),
+        ("LOCALAPPDATA", ("Programs", "nodejs")),
+        ("APPDATA", ("npm",)),
+        ("PROGRAMDATA", ("nvm",)),
+    ):
+        base = os.environ.get(env_key)
+        if base:
+            dirs.append(os.path.join(base, *tail))
+    return [d for d in dirs if os.path.isdir(d)]
+
+
 def _find_executable(name: str) -> str:
-    """在 PATH 中查找可执行文件 (Windows 下优先 .cmd)"""
+    """查找可执行文件: 支持绝对路径 / PATH / Windows 常见安装目录 (优先 .cmd/.exe)"""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if os.path.dirname(name):  # 调用方已给出路径
+        return name
+
     exts = (".cmd", ".exe", ".bat") if os.name == "nt" else ("",)
+    for directory in _candidate_bin_dirs():
+        for ext in exts:
+            path = os.path.join(directory, name + ext)
+            if os.path.isfile(path):
+                return path
     for ext in exts:
         found = shutil.which(name + ext)
         if found:
             return found
-    found = shutil.which(name)
-    if found:
-        return found
-    return name
+    return shutil.which(name) or name
 
 
 class AmagiService:
-    """管理 amagi 子模块的构建与常驻 HTTP 桥接进程"""
+    """管理 amagi 运行时 (npm 自动安装) 与常驻 HTTP 桥接进程"""
 
     def __init__(self, plugin_dir: Path, cfg: Dict[str, Any]):
         self.plugin_dir = Path(plugin_dir)
         self.cfg = cfg
 
-        # 子模块定位: 默认 <plugin_dir>/amagi, 允许配置 amagi_dir 覆盖
+        # amagi 运行时目录: 默认 <plugin_dir>/.amagi, 允许配置 amagi_dir 覆盖
+        # (若你已有一份完整 amagi 源码仓库, 把 amagi_dir 指向它即可直接使用)
         configured = str(cfg.get("amagi_dir") or "").strip()
         if configured:
             self.amagi_dir = Path(configured).expanduser()
         else:
-            self.amagi_dir = self.plugin_dir / "amagi"
+            self.amagi_dir = self.plugin_dir / ".amagi"
         self.server_script = self.plugin_dir / "amagi_bridge" / "server.mjs"
 
         self.host = "127.0.0.1"
         self.port = int(cfg.get("amagi_port", 48211) or 48211)
+
+        # amagi 版本 (留空用默认) 与 npm 源 (留空用 npmmirror)
+        self.amagi_version = str(cfg.get("amagi_version") or "").strip() or _DEFAULT_AMAGI_VERSION
+        self.npm_registry = str(cfg.get("npm_registry") or "").strip() or _DEFAULT_REGISTRY
 
         # 数据/日志目录 (AstrBot 标准数据目录)
         data_dir = StarTools.get_data_dir(plugin_name="astrbot_plugin_amagi_douyin_push")
@@ -89,14 +151,15 @@ class AmagiService:
         os.makedirs(self.log_dir, exist_ok=True)
 
         self.node_bin = _find_executable(str(cfg.get("node_path") or "node"))
-        self.pnpm_bin = _find_executable(str(cfg.get("pnpm_path") or "pnpm"))
+        self.npm_bin = _find_executable(str(cfg.get("npm_path") or "npm"))
+        self.amagi_entry: Optional[Path] = None   # 已定位到的 dist 入口文件
 
         self.cookie: str = ""
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._started: bool = False      # 是否已成功监听端口
-        self._build_done: bool = False   # 本轮是否已检查/构建过 amagi
+        self._build_done: bool = False   # 本轮是否已检查/安装过 amagi
         self._build_ok: bool = False
-        self._build_msg: str = "尚未检查 amagi 构建产物"
+        self._build_msg: str = "尚未检查 amagi 运行时"
         self._last_err: str = ""
         self._ready_attempted_at: float = 0.0
         self._warn_cookie: bool = False
@@ -114,8 +177,8 @@ class AmagiService:
 
     @property
     def dist_ready(self) -> bool:
-        """构建产物是否存在"""
-        return any((self.amagi_dir / cand).exists() for cand in _DIST_CANDIDATES)
+        """amagi 运行时入口是否已就绪"""
+        return self._locate_entry() is not None
 
     @property
     def cookie_configured(self) -> bool:
@@ -134,57 +197,129 @@ class AmagiService:
             "port": self.port,
             "cookie_configured": self.cookie_configured,
             "node": self.node_bin,
+            "npm": self.npm_bin,
             "amagi_dir": str(self.amagi_dir),
+            "amagi_version": self.amagi_version,
+            "entry": str(self.amagi_entry) if self.amagi_entry else "",
             "last_error": self._last_err,
         }
 
-    # ---------------- 构建 ----------------
+    # ---------------- 定位 / 安装 amagi 运行时 ----------------
+
+    def _locate_entry(self) -> Optional[Path]:
+        """在 amagi_dir 中按候选布局定位 amagi dist 入口"""
+        for rel in _ENTRY_REL_CANDIDATES:
+            path = self.amagi_dir / rel
+            if path.is_file():
+                return path
+        return None
+
+    def _npm_available(self) -> bool:
+        return bool(self.npm_bin) and (
+            os.path.isfile(self.npm_bin) or bool(shutil.which(self.npm_bin))
+        )
+
+    def _write_runtime_pkg(self):
+        """写入 npm 安装所需的最小 package.json (已存在则不覆盖)"""
+        pkg = self.amagi_dir / "package.json"
+        if pkg.exists():
+            return
+        try:
+            with open(pkg, "w", encoding="utf-8") as fp:
+                json.dump(_RUNTIME_PKG_JSON, fp, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"写入运行时 package.json 失败: {e}")
+
+    def _install_error_hint(self) -> str:
+        return (
+            f"npm 安装失败, 请检查网络与 npm 源 (当前: {self.npm_registry})。\n"
+            f"也可手动执行: cd {self.amagi_dir} && npm install {_AMAGI_PKG}@{self.amagi_version} "
+            f"--registry {self.npm_registry}"
+        )
 
     def _prepare_sync(self) -> bool:
-        """同步确保 amagi 已安装依赖并产出 dist (供线程中调用)"""
-        if not self.amagi_dir.exists():
-            self._build_msg = f"未找到 amagi 目录: {self.amagi_dir}"
-            logger.error(self._build_msg)
-            return False
-        if not (self.amagi_dir / "package.json").exists():
-            self._build_msg = f"amagi 目录无效 (缺少 package.json): {self.amagi_dir}"
-            logger.error(self._build_msg)
-            return False
-        if self.dist_ready:
+        """
+        同步确保 amagi 运行时可用 (供线程中调用):
+
+          1. amagi_dir 中已存在 dist 入口 (完整仓库 / npm 目录 / 裸包) → 直接使用
+          2. 否则用 npm 安装官方包 @ikenxuan/amagi
+
+        官方 npm 包发布时已内置构建产物 (dist/*), 因此无需 pnpm、无需本地 build,
+        也不需要 git 子模块 —— 这正是 WebUI 安装插件时的可靠路径。
+        """
+        entry = self._locate_entry()
+        if entry:
+            self.amagi_entry = entry
             self._build_ok = True
-            self._build_msg = "amagi 构建产物已就绪"
+            if not self._build_msg.startswith("amagi 已安装"):
+                self._build_msg = "amagi 运行时已就绪"
+            logger.info(f"amagi 运行时已就绪: {entry}")
             return True
 
-        # 需要构建
-        logger.warning(
-            f"amagi 尚未构建 (缺少 {self.amagi_dir / 'packages' / 'core' / 'dist'}). "
-            f"将尝试自动执行 pnpm install / build ..."
+        logger.info(
+            f"未找到 amagi 运行时 ({self.amagi_dir}), 将执行 "
+            f"npm install {_AMAGI_PKG}@{self.amagi_version} ..."
         )
-        if not self._run_cmd(self.pnpm_bin, ["install", "--ignore-scripts"],
-                             self.amagi_dir, step="pnpm install"):
-            self._build_msg = "pnpm install 失败, 请手动在 amagi 目录执行: pnpm install"
-            return False
-        if not self._run_cmd(self.pnpm_bin, ["--filter", "@ikenxuan/amagi", "run", "build"],
-                             self.amagi_dir, step="pnpm build"):
-            self._build_msg = "pnpm build 失败, 请手动在 amagi 目录执行: pnpm --filter @ikenxuan/amagi run build"
+        if not self._npm_available():
+            self._build_msg = (
+                "未检测到 npm, 无法自动安装 amagi。\n"
+                "请安装 Node.js ≥ 18 (自带 npm) 后重载插件, "
+                "或在插件配置中填写 npm_path / node_path。"
+            )
+            logger.error(self._build_msg)
             return False
 
-        if self.dist_ready:
-            self._build_ok = True
-            self._build_msg = "amagi 构建成功"
-            logger.info("amagi 构建成功")
-            return True
-        self._build_msg = "构建结束后仍未找到 amagi 产物"
-        return False
+        try:
+            os.makedirs(self.amagi_dir, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            self._build_msg = f"无法创建 amagi 运行时目录 {self.amagi_dir}: {e}"
+            logger.error(self._build_msg)
+            return False
+        self._write_runtime_pkg()
+
+        args = [
+            "install", f"{_AMAGI_PKG}@{self.amagi_version}",
+            "--registry", self.npm_registry,
+            "--no-audit", "--no-fund", "--no-package-lock",
+            "--loglevel", "error",
+        ]
+        if not self._run_cmd(self.npm_bin, args, self.amagi_dir, step="npm install amagi"):
+            self._build_msg = self._install_error_hint()
+            return False
+
+        entry = self._locate_entry()
+        if not entry:
+            self._build_msg = f"npm 安装结束, 但未找到 amagi 产物: {self.amagi_dir}"
+            logger.error(self._build_msg)
+            return False
+
+        self.amagi_entry = entry
+        self._build_ok = True
+        self._build_msg = f"amagi 已自动安装 ({_AMAGI_PKG}@{self.amagi_version})"
+        logger.info(f"amagi 安装完成: {entry}")
+        return True
 
     def _run_cmd(self, cmd: str, args: list, cwd: Path, step: str,
                  timeout: int = 1800) -> bool:
         """运行命令, 输出重定向到日志文件 (避免管道限制)"""
-        log_file = self.log_dir / f"build_{int(time.time())}.log"
+        log_file = self.log_dir / f"provision_{int(time.time())}.log"
+
+        argv = list(args)
+        if os.name == "nt" and cmd.lower().endswith((".cmd", ".bat")):
+            # .cmd / .bat 需经由 cmd.exe 执行
+            argv = ["/c", cmd, *args]
+            cmd = os.environ.get("COMSPEC", "cmd.exe")
+
+        env = dict(os.environ)
+        node_dir = os.path.dirname(self.node_bin or "")
+        if node_dir and os.path.isdir(node_dir):
+            # 保证 npm 能找到同目录下的 node (PATH 未包含 Node 目录时必需)
+            env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
+
         try:
             with open(log_file, "w", encoding="utf-8") as fp:
                 proc = subprocess.run(
-                    [cmd, *args], cwd=str(cwd),
+                    [cmd, *argv], cwd=str(cwd), env=env,
                     stdout=fp, stderr=subprocess.STDOUT,
                     timeout=timeout,
                 )
@@ -212,16 +347,21 @@ class AmagiService:
         except Exception:  # noqa: BLE001
             return ""
 
-    async def prepare(self):
-        """异步准备: 构建检查在线程中执行, 避免阻塞事件循环"""
-        if self._build_done:
+    async def prepare(self, force: bool = False):
+        """
+        异步准备: 定位/安装 amagi 运行时在线程中执行, 避免阻塞事件循环。
+
+        force=True 时忽略上一次的结果重新检查/安装
+        (例如用户刚装好 Node.js 或网络恢复后执行 /dy_bridge_restart)。
+        """
+        if self._build_done and not force:
             return self._build_ok
         self._build_done = True
         loop = asyncio.get_running_loop()
         try:
             self._build_ok = await loop.run_in_executor(None, self._prepare_sync)
         except Exception as e:  # noqa: BLE001
-            self._build_msg = f"构建检查异常: {e}"
+            self._build_msg = f"amagi 运行时检查异常: {e}"
             logger.error(self._build_msg)
             self._build_ok = False
         return self._build_ok
@@ -229,7 +369,7 @@ class AmagiService:
     # ---------------- 进程管理 ----------------
 
     async def ensure_started(self):
-        """确保桥接进程已启动; 未配置 Cookie / 未构建成功则记录原因并返回"""
+        """确保桥接进程已启动; 未配置 Cookie / amagi 未就绪则记录原因并返回"""
         if self.running and self._started:
             return True
 
@@ -260,6 +400,9 @@ class AmagiService:
         env["DOUYIN_COOKIE"] = self.cookie
         env["AMAGI_PORT"] = str(self.port)
         env["AMAGI_DIR"] = str(self.amagi_dir)
+        # 直接把定位到的入口文件传给桥接脚本, 避免 JS 侧重复猜测目录布局
+        if self.amagi_entry:
+            env["AMAGI_ENTRY"] = str(self.amagi_entry)
 
         stdout_path = self.log_dir / "bridge.out.log"
         stderr_path = self.log_dir / "bridge.err.log"
@@ -343,9 +486,10 @@ class AmagiService:
         await self._terminate_proc()
 
     async def restart(self):
-        """重启桥接 (用于 Cookie 变更后)"""
+        """重启桥接 (用于 Cookie 变更后); 会强制重新检查/安装 amagi 运行时"""
         await self._terminate_proc()
         self._ready_attempted_at = 0.0
+        await self.prepare(force=True)
         return await self.ensure_started()
 
     # ---------------- HTTP 调用 ----------------

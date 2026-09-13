@@ -27,8 +27,9 @@ plugin_dir = Path(__file__).parent
 
 # ==================== 数据源说明 ====================
 # 本插件的数据源为 amagi (https://github.com/ikenxuan/amagi, Node.js SDK):
-#   - amagi 以 git 子模块形式放在 <插件目录>/amagi
-#   - 插件启动时会拉起 amagi_bridge/server.mjs (amagi 官方 HTTP 服务)
+#   - amagi 不再以 git 子模块分发 (WebUI 安装不会拉子模块, 会导致目录为空),
+#     改为插件启动时自动用 npm 安装官方包 @ikenxuan/amagi 到 <插件目录>/.amagi
+#   - 插件随后拉起 amagi_bridge/server.mjs (amagi 官方 HTTP 服务)
 #   - Python 侧通过 http://127.0.0.1:<amagi_port> 调用 /api/douyin/* 获取数据
 # 订阅一律按「抖音用户 (sec_uid/主页URL)」锚定, 直播上下播通过用户主页接口
 # 返回的 live_status / live_room 字段判断。
@@ -38,7 +39,7 @@ plugin_dir = Path(__file__).parent
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -72,7 +73,7 @@ class Main(Star):
             cfg=self.cfg
         )
 
-        # 6. 后台准备并启动 amagi 桥接 (构建产物缺失时自动 pnpm install/build)
+        # 6. 后台准备并启动 amagi 桥接 (运行时缺失时自动 npm 安装)
         self._amagi_task: Optional[asyncio.Task] = None
         asyncio.create_task(self._boot_amagi())
 
@@ -86,7 +87,7 @@ class Main(Star):
     # ==================== amagi 桥接 ====================
 
     async def _boot_amagi(self):
-        """准备构建产物并拉起常驻桥接进程"""
+        """准备 amagi 运行时并拉起常驻桥接进程"""
         try:
             await self.amagi.prepare()
             await self.amagi.ensure_started()
@@ -489,7 +490,7 @@ class Main(Star):
     @command("dy_bridge_restart")
     @permission_type(PermissionType.ADMIN)
     async def dy_bridge_restart(self, event: AstrMessageEvent):
-        """重启 amagi 数据桥接（管理员；修改 Cookie 配置后调用）"""
+        """重启 amagi 数据桥接（管理员；改 Cookie 后调用，也会重新检查/安装 amagi 运行时）"""
         # 重新读取配置中的 Cookie (兼容 AstrBot 运行期改配置)
         cookie = (self.cfg.get("douyin_cookie", "").strip()
                   or self.cfg.get("douyin_live_cookie", "").strip())
@@ -526,7 +527,7 @@ class Main(Star):
 
         bridge = self.amagi.status_info()
         bridge_state = "🟢 运行中" if bridge["running"] else "🔴 未运行"
-        bridge_build = "✅ 已构建" if bridge["built"] else "❌ 未构建"
+        amagi_ready = "✅ 已就绪" if bridge["built"] else "❌ 未就绪"
         bridge_err = bridge["last_error"] or bridge["build_msg"]
 
         msg = (
@@ -539,7 +540,7 @@ class Main(Star):
             f"订阅总数: {total_subs}\n"
             f"{'=' * 20}\n"
             f"amagi 桥接: {bridge_state} ({bridge['port']})\n"
-            f"桥接构建: {bridge_build}\n"
+            f"amagi 运行时: {amagi_ready} (v{bridge['amagi_version']})\n"
             f"说明: {bridge_err}"
         )
         yield event.plain_result(msg)

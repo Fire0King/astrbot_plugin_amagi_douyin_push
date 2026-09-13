@@ -91,6 +91,12 @@ node_modules/
 .pnpm-store/
 *.log
 
+# amagi 运行时（由插件自动 npm 安装，不入库）
+#   .amagi/  → 插件默认的运行时目录
+#   amagi/   → 旧版 git 子模块目录，现已弃用（避免误提交）
+/.amagi/
+/amagi/
+
 # IPython
 profile_default/
 ipython_config.py

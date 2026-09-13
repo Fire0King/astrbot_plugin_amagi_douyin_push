@@ -3,19 +3,21 @@
  * amagi 桥接服务入口 (由 Python 插件侧常驻拉起)
  *
  * 职责:
- *   1. 加载插件目录下 amagi 子模块的构建产物 (packages/core/dist/default/index.{mjs,cjs})
+ *   1. 加载 amagi 的构建产物 (支持完整仓库 / npm 安装 / 裸包目录三种布局)
  *   2. 用插件配置的抖音 Cookie 创建 amagi 客户端并启动其内置 HTTP 服务
  *   3. 在 stdout 输出机器可读的就绪/错误信息, 供 Python 侧判断启动结果
  *
  * 环境变量:
  *   DOUYIN_COOKIE  抖音 Cookie (必须)
  *   AMAGI_PORT     监听端口 (默认 48211)
- *   AMAGI_DIR      amagi 仓库所在目录 (默认: 本文件上一级的 amagi/)
+ *   AMAGI_ENTRY    amagi dist 入口文件的绝对路径 (优先使用; 由 Python 侧定位后传入)
+ *   AMAGI_DIR      amagi 运行时目录 (默认: 本文件上一级的 .amagi/)
  *
  * 退出码:
  *   0  正常退出
  *   1  启动失败 (产物缺失 / 端口占用 / 未安装依赖等)
  */
+import { access } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -23,15 +25,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const pluginRoot = path.resolve(__dirname, '..')
 
 const env = process.env
-const amagiDir = env.AMAGI_DIR ? path.resolve(env.AMAGI_DIR) : path.join(pluginRoot, 'amagi')
+const amagiDir = env.AMAGI_DIR ? path.resolve(env.AMAGI_DIR) : path.join(pluginRoot, '.amagi')
 const cookie = env.DOUYIN_COOKIE || ''
 const port = Number.parseInt(env.AMAGI_PORT || '48211', 10)
 
-const DIST_DIR = path.join(amagiDir, 'packages', 'core', 'dist')
 const ENTRY_CANDIDATES = [
-  path.join(DIST_DIR, 'default', 'index.mjs'),
-  path.join(DIST_DIR, 'default', 'index.cjs'),
-]
+  // Python 侧已定位好的入口 (最可靠, 优先)
+  env.AMAGI_ENTRY ? path.resolve(env.AMAGI_ENTRY) : null,
+  // 完整仓库布局
+  path.join(amagiDir, 'packages', 'core', 'dist', 'default', 'index.mjs'),
+  path.join(amagiDir, 'packages', 'core', 'dist', 'default', 'index.cjs'),
+  // npm 安装布局
+  path.join(amagiDir, 'node_modules', '@ikenxuan', 'amagi', 'dist', 'default', 'index.mjs'),
+  path.join(amagiDir, 'node_modules', '@ikenxuan', 'amagi', 'dist', 'default', 'index.cjs'),
+  // 裸包目录布局
+  path.join(amagiDir, 'dist', 'default', 'index.mjs'),
+  path.join(amagiDir, 'dist', 'default', 'index.cjs'),
+].filter(Boolean)
 
 function fail(msg) {
   // 统一以固定前缀输出, Python 侧按行解析
@@ -42,7 +52,7 @@ function fail(msg) {
 async function resolveEntry() {
   for (const candidate of ENTRY_CANDIDATES) {
     try {
-      await import('node:fs/promises').then((fs) => fs.access(candidate))
+      await access(candidate)
       return candidate
     } catch {
       // 继续尝试下一个候选
@@ -59,8 +69,9 @@ async function main() {
   const entry = await resolveEntry()
   if (!entry) {
     return fail(
-      `未找到 amagi 构建产物 (${path.join(DIST_DIR, 'default')}). ` +
-        `请先在插件目录执行: cd amagi && pnpm install && pnpm --filter @ikenxuan/amagi run build`
+      `未找到 amagi 构建产物 (已尝试: ${ENTRY_CANDIDATES.join(', ')}). ` +
+        `正常情况下插件会自动执行 npm install @ikenxuan/amagi, ` +
+        `也可手动执行: cd ${amagiDir} && npm install @ikenxuan/amagi`
     )
   }
 

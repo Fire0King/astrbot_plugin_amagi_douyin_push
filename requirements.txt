@@ -2,7 +2,7 @@
 requests>=2.28.0
 
 # ─── 说明 ───
-# 抖音数据获取全部交由 amagi (Node.js SDK, 以 git 子模块随插件部署):
-#   1. 克隆子模块:  git submodule add https://github.com/ikenxuan/amagi.git amagi
-#   2. 安装依赖并构建: cd amagi && pnpm install && pnpm --filter @ikenxuan/amagi run build
+# 抖音数据获取全部交由 amagi (Node.js SDK)。amagi 运行时由插件自动获取:
+#   插件启动时执行 npm install @ikenxuan/amagi 到 <插件目录>/.amagi
+#   (npm 包自带构建产物 dist/*, 无需 pnpm、无需本地 build、不依赖 git 子模块)
 # Python 侧只需 requests 访问本机 amagi 桥接的 HTTP 服务。

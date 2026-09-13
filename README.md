@@ -2,8 +2,9 @@
 
 一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件，用于**监控抖音用户的视频更新和直播状态**，实时推送开播提醒与视频发布通知到指定会话。
 
-数据抓取基于 [amagi](https://github.com/ikenxuan/amagi)（Node.js SDK，以 git 子模块形式随插件部署）：
-插件启动时自动拉起常驻的 amagi HTTP 服务，Python 侧通过本机端口调用抖音网页版接口，**无需单独部署数据服务**。
+数据抓取基于 [amagi](https://github.com/ikenxuan/amagi)（Node.js SDK）。**无需 git 子模块、无需 pnpm、无需手动构建**：
+插件首次启动时自动用 npm 安装官方包 `@ikenxuan/amagi`（该包已内置构建产物）到插件目录下的 `.amagi/`，
+随后拉起常驻的 amagi HTTP 服务，Python 侧通过本机端口调用抖音网页版接口。
 
 > 📌 **订阅语义**：视频与直播订阅**均锚定主播用户（sec_uid / 用户主页 URL）**。
 > 直播监控无法仅凭直播间房间号解析主播身份，请使用 `/dy_sub live <主播主页URL>`。
@@ -28,35 +29,53 @@
 
 | 软件 | 说明 |
 |------|------|
-| Node.js ≥ 18 | amagi 运行环境 |
-| pnpm | amagi 依赖安装/构建（`npm i -g pnpm` 或 `corepack enable` 后自带） |
+| Node.js ≥ 18 | amagi 运行环境（自带 npm，用于自动安装 amagi） |
 | Python ≥ 3.9 | AstrBot 环境 |
 
-### 1. 克隆插件
+### 1. 在 AstrBot WebUI 中安装
+
+插件市场搜索安装，或用仓库链接安装：
+
+```
+https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push
+```
+
+AstrBot 会把插件放进 `AstrBot/data/plugins/astrbot_plugin_amagi_douyin_push/`。
+
+也可以手动克隆（**不需要** `--recurse-submodules`）：
 
 ```bash
 cd AstrBot/data/plugins
-git clone --recurse-submodules https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push.git
-cd astrbot_plugin_amagi_douyin_push
+git clone https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push.git
 ```
 
-> ⚠️ 必须带 `--recurse-submodules`。若已克隆但 `amagi/` 是空目录，补执行：
+### 2. amagi 运行时（自动，无需操作）
+
+插件启动时会自动完成以下流程，**通常不需要你手动做任何事**：
+
+1. 检查插件目录下 `.amagi/` 是否已有 amagi 运行时
+2. 没有则执行 `npm install @ikenxuan/amagi@6.6.0`（默认走 npmmirror 源）
+3. 定位 `dist/default/index.mjs` 并拉起桥接进程
+
+安装日志与桥接日志位于 AstrBot 数据目录：
+
+```
+AstrBot/data/plugin_data/astrbot_plugin_amagi_douyin_push/amagi_bridge/
+├── provision_*.log   # npm 安装日志
+├── bridge.out.log    # 桥接 stdout
+└── bridge.err.log    # 桥接 stderr
+```
+
+> 💡 如果自动安装失败（例如网络不通），可手动执行一次，之后插件会直接复用：
 > ```bash
-> git submodule update --init --recursive
+> cd AstrBot/data/plugins/astrbot_plugin_amagi_douyin_push
+> mkdir .amagi && cd .amagi
+> npm install @ikenxuan/amagi@6.6.0 --registry https://registry.npmmirror.com
 > ```
+> 完成后在 WebUI 里重载插件（或执行 `/dy_bridge_restart`）。
 
-### 2. 构建 amagi（一次性）
-
-插件首次加载会自动尝试执行以下命令，也可以手动先执行以免插件启动等待：
-
-```bash
-cd amagi
-pnpm install
-pnpm --filter @ikenxuan/amagi run build
-cd ..
-```
-
-构建产物位于 `amagi/packages/core/dist`，插件启动时会检查该目录，缺失即自动构建。
+> 💡 如果你已有一份 amagi 源码仓库，也可以打开插件配置里的 `amagi_dir` 指向它，
+> 插件会自动识别 `packages/core/dist/default/index.mjs`（需自行 `pnpm build` 过）。
 
 ### 3. 安装 Python 依赖
 
@@ -75,9 +94,10 @@ pip install -r requirements.txt
 | `poll_interval` | 轮询间隔（秒），默认 60，最小 10 |
 | `enable_live_monitor` | 是否开启直播监控，默认开启 |
 | `amagi_port` | 桥接监听端口（默认 48211，本机 127.0.0.1） |
-| `amagi_dir` | amagi 目录（默认插件目录下 `amagi/`，一般无需修改） |
-| `node_path` | node 可执行文件路径（留空自动从 PATH 查找） |
-| `pnpm_path` | pnpm 可执行文件路径（留空自动从 PATH 查找） |
+| `amagi_dir` | amagi 运行时目录（默认 `.amagi/`，一般无需修改） |
+| `amagi_version` | amagi 版本（默认 6.6.0，一般无需修改） |
+| `npm_registry` | npm 源（默认 npmmirror，国内建议保持） |
+| `node_path` / `npm_path` | node / npm 可执行文件路径（留空自动查找） |
 | `rai` | 图片卡片渲染开关（需 AstrBot HTML 渲染支持） |
 
 #### 获取 Cookie
@@ -144,7 +164,7 @@ pip install -r requirements.txt
 | `/dy_clear` | 清空当前会话所有订阅 |
 | `/dy_global_list` | 查看所有会话的订阅 |
 | `/dy_global_unsub <UMO> <UID>` | 删除指定会话指定用户的订阅 |
-| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行） |
+| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行，会重新检查 amagi 运行时） |
 | `/dy_status` | 查看插件与桥接运行状态 |
 
 ---
@@ -157,7 +177,7 @@ astrbot_plugin_amagi_douyin_push/
 ├── metadata.yaml            # 插件元数据
 ├── _conf_schema.json        # 配置定义
 ├── requirements.txt         # Python 依赖
-├── amagi/                   # amagi 子模块 (Node.js SDK)
+├── .amagi/                  # amagi 运行时（自动创建，npm 安装，不入库）
 ├── amagi_bridge/
 │   └── server.mjs           # Node 桥接入口（启动 amagi HTTP 服务）
 ├── core/
@@ -176,41 +196,49 @@ astrbot_plugin_amagi_douyin_push/
 
 ## 🚨 常见问题
 
-### Q1: 提示 `amagi 目录无效 (缺少 package.json)` 或“未找到 amagi 目录”
+### Q1: 提示“未找到 amagi 运行时 / 未检测到 npm”
 
-**原因**：克隆时没加 `--recurse-submodules`，`amagi/` 只是个空目录。
-
-**解决**：
-```bash
-cd AstrBot/data/plugins/astrbot_plugin_amagi_douyin_push
-git submodule update --init --recursive
-```
-若提示 `amagi` 不是已登记的子模块，则手动添加：
-```bash
-git submodule add https://github.com/ikenxuan/amagi.git amagi
-git submodule update --init --recursive
-```
-
-### Q2: 提示 amagi 未构建 / 启动失败，日志里有 pnpm 报错
-
-**原因**：amagi 子模块未安装依赖或未构建。
+**原因**：插件会自动用 npm 安装 amagi；若系统没装 Node.js（或 AstrBot 进程的 PATH 里找不到 node/npm），
+自动安装就无法进行。
 
 **解决**：
-```bash
-cd AstrBot/data/plugins/astrbot_plugin_amagi_douyin_push/amagi
-pnpm install
-pnpm --filter @ikenxuan/amagi run build
-cd ..
-```
-然后在 WebUI 里**重载插件**（或执行 `/dy_bridge_restart`）。
+1. 安装 [Node.js](https://nodejs.org/) ≥ 18（安装包自带 npm），**重启 AstrBot** 使其继承新的 PATH；
+2. 若 node 装在非标准位置，可在插件配置里填写 `node_path` 与 `npm_path`；
+3. 或手动安装一次，插件之后会直接复用：
+   ```bash
+   cd AstrBot/data/plugins/astrbot_plugin_amagi_douyin_push
+   mkdir .amagi && cd .amagi
+   npm install @ikenxuan/amagi@6.6.0 --registry https://registry.npmmirror.com
+   ```
+   然后在 WebUI 里**重载插件**（或执行 `/dy_bridge_restart`）。
+
+> ✅ 旧版本要求 `git clone --recurse-submodules` 并手动 `pnpm build`，**现已完全不需要**。
+> 如果你是从旧版本升级过来的，可以删掉遗留的 `amagi/` 目录，插件会改用 `.amagi/`。
+
+### Q2: npm 安装失败（网络不通 / 超时）
+
+**原因**：访问 npm 源失败。
+
+**解决**：插件默认使用国内可直连的 `https://registry.npmmirror.com`。
+若你的环境需要走代理或其他镜像，改插件配置里的 `npm_registry` 即可，例如：
+
+| 场景 | `npm_registry` 建议值 |
+|------|----------------------|
+| 国内直连（默认） | `https://registry.npmmirror.com` |
+| 官方源 / 有代理 | `https://registry.npmjs.org` |
+| 私有镜像 | 你的镜像地址 |
+
+改完执行 `/dy_bridge_restart` 重试（该命令会强制重新检查并安装）。
 
 ### Q3: 端口被占用（桥接一直未就绪）
 
 在插件设置里修改 `amagi_port`（如 48212）后重载插件。若残留了旧的 node 进程，请先结束它再重载。
 
-### Q4: 提示“需要 Node.js/pnpm”
+### Q4: 为什么不用 git 子模块 / 不需要 pnpm 了？
 
-请安装 [Node.js](https://nodejs.org/) ≥ 18，并执行 `npm i -g pnpm`（或 `corepack enable && corepack prepare pnpm@latest --activate`）后重载插件。
+AstrBot WebUI 通过仓库链接安装插件时不会拉取 git 子模块，旧方案会导致 `amagi/` 目录为空、插件无法启动。
+而 amagi 官方 npm 包发布时**已内置构建产物**（`dist/*`），所以现在改为运行时 `npm install @ikenxuan/amagi`，
+既不需要子模块，也不需要 pnpm 与本地构建。
 
 ### Q5: 为什么直播订阅不能用直播间房间号？
 
@@ -226,7 +254,7 @@ amagi 的直播间接口要求同时提供内部 `room_id` 与 `web_rid`，无�
 
 ## 📄 许可证
 
-本项目基于 MIT 许可证开源（amagi 子模块为 GPL-3.0，仅作本地运行依赖）。
+本项目基于 MIT 许可证开源（运行期自动安装的 amagi 为 GPL-3.0，仅作本地运行依赖，不随本项目分发）。
 
 ## 🙏 致谢
 

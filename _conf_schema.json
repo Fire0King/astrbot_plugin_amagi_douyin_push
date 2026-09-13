@@ -30,17 +30,30 @@
         "maximum": 65535
     },
     "amagi_dir": {
-        "description": "amagi 仓库目录（默认插件目录下 amagi/，一般无需修改）",
+        "description": "amagi 运行时目录（默认插件目录下 .amagi，缺失时自动 npm 安装，一般无需修改）",
+        "hint": "若你已有一份完整 amagi 源码仓库，可把此处置为仓库路径直接复用",
         "type": "string",
         "default": ""
+    },
+    "amagi_version": {
+        "description": "amagi 版本（npm 包 @ikenxuan/amagi 的版本号，留空使用插件内置默认值）",
+        "hint": "默认 6.6.0；一般无需修改",
+        "type": "string",
+        "default": "6.6.0"
+    },
+    "npm_registry": {
+        "description": "npm 源（用于自动安装 amagi，国内建议使用 npmmirror）",
+        "hint": "默认 https://registry.npmmirror.com；若你已配置全局镜像可改为 https://registry.npmjs.org",
+        "type": "string",
+        "default": "https://registry.npmmirror.com"
     },
     "node_path": {
-        "description": "node 可执行文件路径（留空自动从 PATH 查找，一般无需修改）",
+        "description": "node 可执行文件路径（留空自动从 PATH 与常见安装目录查找，一般无需修改）",
         "type": "string",
         "default": ""
     },
-    "pnpm_path": {
-        "description": "pnpm 可执行文件路径（留空自动从 PATH 查找，一般无需修改）",
+    "npm_path": {
+        "description": "npm 可执行文件路径（留空自动从 PATH 与常见安装目录查找，一般无需修改）",
         "type": "string",
         "default": ""
     },
