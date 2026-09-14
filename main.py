@@ -10,6 +10,7 @@ from astrbot.core.star.filter.command import GreedyStr
 
 from .core.data_manager import DataManager
 from .core.douyin import (
+    get_create_time,
     get_live_snapshot,
     get_user_nickname,
     get_user_profile,
@@ -39,7 +40,7 @@ plugin_dir = Path(__file__).parent
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.3",
+    "1.0.4",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -377,8 +378,9 @@ class Main(Star):
                     yield event.plain_result("❌ 未获取到视频数据，请检查 Cookie 或 sec_uid 是否正确")
                     return
 
-                # 信任 API 顺序，取第一个（最新）
-                latest = works[0]
+                # 列表首位可能是「置顶旧作」, 因此按发布时间取真正最新的一条
+                candidates = [w for w in works if get_create_time(w)]
+                latest = max(candidates, key=get_create_time) if candidates else works[0]
                 nickname = latest.get('author', {}).get('nickname', sec_uid)
 
                 dummy_record = SubscriptionRecord(

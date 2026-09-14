@@ -8,7 +8,13 @@ from astrbot.api.message_components import AtAll, Image, Plain
 from astrbot.core.star import Context
 
 from ..core.data_manager import DataManager
-from ..core.douyin import get_live_snapshot, get_user_works
+from ..core.douyin import (
+    get_aweme_id,
+    get_create_time,
+    get_live_snapshot,
+    get_user_works,
+    is_pinned,
+)
 from ..core.models import SubscriptionRecord
 from ..core.utils import build_user_url, build_video_url
 from .renderer import Renderer
@@ -160,7 +166,17 @@ class DouyinListener:
                 await asyncio.sleep(10)
 
     async def _check_user_videos(self, sub_user: str, record: SubscriptionRecord):
-        """检查单个用户的视频更新（信任API顺序，遇已知ID停）"""
+        """
+        检查单个用户的视频更新。
+
+        关于置顶作品：抖音用户作品列表会把**置顶作品排在最前面**，而置顶作品往往是旧作。
+        因此不能依赖「列表顺序 + 遇到已知 ID 就停」来判新旧：
+          - 置顶作品恰好是已知 ID 时, 第一项就 break → 之后的新作品永远检测不到（漏推）
+          - 置顶作品换了一个 → 列表首项是未记录过的旧作品 → 会被误当成新作品推送
+
+        现在改为：有 create_time 就以「发布时间 >= 基线时间」判定新作品,
+        无 create_time 时退化为「未推送过且非置顶」，置顶作品不再参与顺序推断。
+        """
         sec_uid = record.sec_uid or record.uid
         if not sec_uid:
             return
@@ -179,81 +195,103 @@ class DouyinListener:
                 logger.debug(f"用户 {sec_uid} 作品列表为空, 跳过")
                 return
 
-            # 构建已知 ID 集合（最后推送的 + 最近缓存的）
-            known_ids = set()
-            if record.last_video_id:
-                known_ids.add(record.last_video_id)
-            if record.recent_ids:
-                known_ids.update(record.recent_ids)
-
-            # 遍历 API 返回（信任 API 顺序：新→旧），收集新视频直到遇到已知 ID
-            new_videos = []
+            items = []   # [(aweme_id, create_time, pinned, raw)]
             for w in works:
-                wid = str(w.get('aweme_id', ''))
-                if not wid:
-                    continue
-                if wid in known_ids:
-                    break  # 遇到已知 ID，后面的都是旧的
-                new_videos.append(w)
+                wid = get_aweme_id(w)
+                if wid:
+                    items.append((wid, get_create_time(w), is_pinned(w), w))
+            if not items:
+                return
 
-            # 首次订阅 / 没有已知 ID
+            # 已知 ID：最后推送的 + 最近缓存
+            known_ids = set(record.recent_ids or [])
+            if record.last_video_id:
+                known_ids.add(str(record.last_video_id))
+            baseline_time = int(record.last_video_time or 0)
+
+            # 首次订阅：只建立基线, 不推送
             if not record.last_video_id:
-                if new_videos:
-                    latest = new_videos[0]
-                    latest_id = str(latest.get('aweme_id', ''))
-                    record.last_video_id = latest_id
-                    self.data_manager.update_subscription(
-                        sub_user, record.uid, 'video',
-                        last_video_id=latest_id,
-                        recent_ids=[latest_id],
-                        nickname=latest.get('author', {}).get('nickname', record.nickname)
-                    )
-                    logger.info(
-                        f"首次记录用户 {sec_uid} 的最新视频: {latest_id} "
-                        f"(仅记录基线, 不推送; 之后的更新才会推送)"
-                    )
-                return
-
-            # 旧数据迁移：有 last_video_id 但 recent_ids 为空（升级前的老数据）
-            # → 不推送，只缓存当前最新一批 ID，下次开始正常检测
-            if record.last_video_id and not record.recent_ids:
-                all_ids = [str(w.get('aweme_id', '')) for w in works if w.get('aweme_id')]
-                cache_ids = all_ids[:5]
-                self.data_manager.update_subscription(
-                    sub_user, record.uid, 'video',
-                    recent_ids=cache_ids,
+                latest = self._pick_baseline(items)
+                self._save_video_baseline(sub_user, record, items, latest)
+                logger.info(
+                    f"首次记录用户 {sec_uid} 的最新视频: {latest[0]} "
+                    f"(仅记录基线, 不推送; 之后的更新才会推送)"
                 )
-                logger.info(f"旧数据迁移：已缓存 {len(cache_ids)} 个视频ID")
                 return
 
-            # 有已知 ID，但没有新视频
-            if not new_videos:
+            # 旧数据迁移：升级前的老数据没有时间基线 → 只补基线, 不推送, 防止误推置顶/旧作
+            if not baseline_time:
+                latest = self._pick_baseline(items)
+                self._save_video_baseline(sub_user, record, items, latest)
+                logger.info("旧数据迁移：已补视频时间基线 (本次不推送)")
                 return
 
-            # 有新视频 → 推送
-            nickname = new_videos[-1].get('author', {}).get('nickname', record.nickname)
-            new_ids = [str(w.get('aweme_id', '')) for w in new_videos]
-            latest_id = new_ids[0]
+            # 收集新作品：未推送过, 且发布时间不早于基线
+            new_items = [it for it in items if self._is_new_video(it, known_ids, baseline_time)]
+            if not new_items:
+                return
+
+            new_items.sort(key=lambda it: it[1] or 0)   # 旧 → 新依次推送
+            new_ids = [it[0] for it in new_items]
+            newest = new_items[-1]
+            nickname = newest[3].get('author', {}).get('nickname', record.nickname)
             logger.info(
-                f"检测到用户 {sec_uid} 更新 {len(new_videos)} 个新视频: {new_ids}"
+                f"检测到用户 {sec_uid} 更新 {len(new_items)} 个新视频: {new_ids} "
+                f"(跳过置顶 {sum(1 for it in items if it[2])} 个)"
             )
 
-            # 更新记录：last = 最新ID, recent_ids = 最近几条缓存
-            updated_recent = list(dict.fromkeys(new_ids + [record.last_video_id] + (record.recent_ids or [])))[:5]
+            # 更新记录：last = 最新ID/时间, recent_ids = 最近一批去重缓存
+            updated_recent = list(dict.fromkeys(
+                new_ids[::-1] + [str(record.last_video_id)] + (record.recent_ids or [])
+            ))[:8]
             self.data_manager.update_subscription(
                 sub_user, record.uid, 'video',
-                last_video_id=latest_id,
+                last_video_id=newest[0],
+                last_video_time=max(newest[1] or 0, baseline_time),
                 recent_ids=updated_recent,
                 nickname=nickname
             )
 
             # 从旧到新推送
-            for work in reversed(new_videos):
+            for _wid, _ct, _pinned, work in new_items:
                 await self._push_video_message(sub_user, record, work)
 
         except Exception as e:
             self.last_error = f"检查用户 {sec_uid} 视频失败: {e}"
             logger.error(self.last_error)
+
+    @staticmethod
+    def _pick_baseline(items: list) -> tuple:
+        """选出基线作品: 取发布时间最新的一条; 都没有时间时退化为首个非置顶作品"""
+        timed = [it for it in items if it[1]]
+        if timed:
+            return max(timed, key=lambda it: it[1])
+        normal = [it for it in items if not it[2]]
+        return (normal or items)[0]
+
+    @staticmethod
+    def _is_new_video(item: tuple, known_ids: set, baseline_time: int) -> bool:
+        """判断是否为新发布的作品（置顶旧作不会被判为新）"""
+        wid, create_time, pinned, _raw = item
+        if wid in known_ids:
+            return False
+        if create_time:
+            return create_time >= baseline_time
+        # 拿不到发布时间时保守处理: 只接受非置顶作品
+        return not pinned
+
+    def _save_video_baseline(self, sub_user: str, record: SubscriptionRecord,
+                             items: list, latest: tuple):
+        """写入视频基线 (last_video_id / last_video_time / recent_ids / nickname)"""
+        timed = sorted([it for it in items if it[1]], key=lambda it: it[1], reverse=True)
+        recent = [it[0] for it in timed[:8]] or [latest[0]]
+        self.data_manager.update_subscription(
+            sub_user, record.uid, 'video',
+            last_video_id=latest[0],
+            last_video_time=latest[1] or 0,
+            recent_ids=recent,
+            nickname=latest[3].get('author', {}).get('nickname', record.nickname),
+        )
 
     async def _push_video_message(self, sub_user: str, record: SubscriptionRecord, work: dict):
         """推送视频消息"""

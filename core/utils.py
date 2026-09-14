@@ -42,6 +42,22 @@ def parse_live_room_id(text: str) -> Optional[str]:
     return None
 
 
+def first_url(media) -> str:
+    """
+    从 {"url_list": [...]} 结构中安全取第一个 URL。
+
+    注意: 不要写成 `media.get("url_list", [None])[0]` —— 默认值只在键**缺失**时生效,
+    若 url_list 存在但为空列表(抖音返回空封面/空头像时很常见)会抛 IndexError,
+    导致整条推送失败。
+    """
+    if not isinstance(media, dict):
+        return ""
+    url_list = media.get("url_list")
+    if not isinstance(url_list, (list, tuple)) or not url_list:
+        return ""
+    return str(url_list[0] or "")
+
+
 def format_number(num) -> str:
     """格式化数字（万、亿）"""
     try:

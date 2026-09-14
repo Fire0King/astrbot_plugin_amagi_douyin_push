@@ -14,7 +14,7 @@ from astrbot.api import logger
 from astrbot.api.all import Star
 
 from ..core.models import LiveInfo, UserInfo, VideoInfo
-from ..core.utils import build_live_url, build_video_url, format_number
+from ..core.utils import build_live_url, build_video_url, first_url, format_number
 
 # 插件根目录
 plugin_dir = Path(__file__).resolve().parent.parent
@@ -94,8 +94,8 @@ class Renderer:
         aweme_id = str(work.get('aweme_id', ''))
         desc = work.get('desc', '无标题')
         statistics = work.get('statistics', {})
-        cover = work.get('video', {}).get('cover', {}).get('url_list', [None])[0] or ""
-        avatar = author.get('avatar_thumb', {}).get('url_list', [None])[0] or ""
+        cover = first_url(work.get('video', {}).get('cover'))
+        avatar = first_url(author.get('avatar_thumb'))
         digg = format_number(statistics.get('digg_count', 0))
         comment = format_number(statistics.get('comment_count', 0))
         collect = format_number(statistics.get('collect_count', 0))
@@ -146,7 +146,7 @@ class Renderer:
         )
 
         if not avatar and work:
-            avatar = work.get('author', {}).get('avatar_thumb', {}).get('url_list', [None])[0] or ""
+            avatar = first_url(work.get('author', {}).get('avatar_thumb'))
 
         img_path = await self._render_card("live_card.html", {
             "badge_class": "live-badge" if is_live else "offline-badge",

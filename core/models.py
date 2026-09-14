@@ -13,6 +13,7 @@ class SubscriptionRecord:
     nickname: str = ""                  # 缓存的用户昵称
     # 视频监控状态
     last_video_id: Optional[str] = None  # 最后推送的视频ID
+    last_video_time: int = 0            # 基线视频的发布时间(create_time)，用于识别置顶/旧作品
     # 直播监控状态
     is_live: bool = False               # 当前是否开播
     live_checked: bool = False          # 是否已建立直播状态基线（首次观测只记录不推送）

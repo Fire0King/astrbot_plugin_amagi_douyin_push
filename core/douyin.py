@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional
 
 from astrbot.api import logger
 
+from .utils import first_url
+
 # ============================================================================
 # 直播状态语义 (集中在此处, 便于真机实测后校准)
 # ============================================================================
@@ -32,17 +34,6 @@ USER_LIVE_STATUS_ON = 1        # user.live_status == 1 视为直播中
 ROOM_STATUS_LIVE = 2           # live_room.status == 2 视为直播中 (webcast 约定)
 
 
-def _first_url(media: Any) -> str:
-    """从 {url_list:[...]} 结构中取第一个图片 URL"""
-    if not isinstance(media, dict):
-        return ""
-    try:
-        url_list = media.get("url_list") or []
-        return str(url_list[0]) if url_list else ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 def _to_int(value: Any) -> Optional[int]:
     """尽力转 int; 无法转换(含 None/空串/异常类型)时返回 None"""
     if value is None or isinstance(value, bool):
@@ -51,6 +42,32 @@ def _to_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def get_aweme_id(item: Any) -> str:
+    """取作品 ID (非字典/缺失时返回空串)"""
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("aweme_id") or "")
+
+
+def get_create_time(item: Any) -> int:
+    """取作品发布时间戳; 拿不到时返回 0"""
+    if not isinstance(item, dict):
+        return 0
+    return _to_int(item.get("create_time")) or 0
+
+
+def is_pinned(item: Any) -> bool:
+    """
+    是否为置顶作品。
+
+    抖音用户作品列表会把置顶作品排在列表最前面（且它们是旧作, 不是最新作品）,
+    列表项带 is_top: 1 标记。判定新作品时不能依赖列表顺序, 否则会被置顶作品干扰。
+    """
+    if not isinstance(item, dict):
+        return False
+    return (_to_int(item.get("is_top")) or 0) == 1
 
 
 # ============================================================================
@@ -138,7 +155,7 @@ async def get_live_snapshot(amagi, sec_uid: str) -> Optional[dict]:
 
     user = profile.get("user") or {}
     nickname = str(user.get("nickname") or sec_uid)
-    avatar = _first_url(user.get("avatar_thumb"))
+    avatar = first_url(user.get("avatar_thumb"))
     room_id = str(user.get("room_id_str") or user.get("room_id") or "")
 
     live_room = user.get("live_room")
