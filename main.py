@@ -39,7 +39,7 @@ plugin_dir = Path(__file__).parent
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.1",
+    "1.0.2",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -103,10 +103,21 @@ class Main(Star):
         self._listener_task = asyncio.create_task(self.listener.start())
         logger.info("后台监听任务已启动")
 
-    def _restart_listener(self):
-        """重启监听服务"""
+    async def _restart_listener(self):
+        """
+        重启监听服务。
+
+        必须 await 旧任务真正结束: 只 cancel() 而不等待时, 旧任务尚未处理完
+        CancelledError, 新任务可能被误判为「已在运行」而直接返回, 导致监听静默失效。
+        """
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
+            try:
+                await self._listener_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"旧监听任务结束异常: {e}")
         self._listener_task = asyncio.create_task(self.listener.start())
         logger.info("监听服务已重启")
 
@@ -208,7 +219,7 @@ class Main(Star):
             )
             results.append(msg)
 
-        self._restart_listener()
+        await self._restart_listener()
         yield event.plain_result("\n".join(results))
 
     async def _fetch_user_nickname(self, sec_uid: str) -> Optional[str]:
@@ -243,7 +254,7 @@ class Main(Star):
                 sub_user, uid, sub_type
             )
             if success:
-                self._restart_listener()
+                await self._restart_listener()
             yield event.plain_result(msg)
         else:
             # 尝试移除 video 和 live
@@ -255,7 +266,7 @@ class Main(Star):
                 if success:
                     results.append(msg)
             if results:
-                self._restart_listener()
+                await self._restart_listener()
                 yield event.plain_result("\n".join(results))
             else:
                 yield event.plain_result(f"⚠️ 未找到 {uid} 的订阅")
@@ -390,7 +401,7 @@ class Main(Star):
         """清空当前会话的所有订阅（管理员）"""
         sub_user = event.unified_msg_origin
         msg = await self.subscription_service.remove_all_for_user(sub_user)
-        self._restart_listener()
+        await self._restart_listener()
         yield event.plain_result(msg)
 
     @command("dy_info")
@@ -484,7 +495,7 @@ class Main(Star):
         target_uid = args[1]
         for st in ['video', 'live']:
             self.data_manager.remove_subscription(target_user, target_uid, st)
-        self._restart_listener()
+        await self._restart_listener()
         yield event.plain_result(f"✅ 已移除 {target_user} 的 {target_uid} 订阅")
 
     @command("dy_bridge_restart")
@@ -523,7 +534,12 @@ class Main(Star):
         """查看插件运行状态（管理员）"""
         cookie_ok = "✅ 已配置" if self.amagi.cookie_configured else "❌ 未配置"
         total_subs = self.subscription_service.get_subscription_count()
-        running = "🟢 运行中" if (self._listener_task and not self._listener_task.done()) else "🔴 已停止"
+        all_subs = self.data_manager.get_all_subscriptions()
+        video_subs = sum(1 for rs in all_subs.values() for r in rs if r.sub_type == 'video')
+        live_subs = sum(1 for rs in all_subs.values() for r in rs if r.sub_type == 'live')
+
+        listener = self.listener.status_info()
+        running = "🟢 运行中" if listener["running"] else "🔴 已停止"
 
         bridge = self.amagi.status_info()
         bridge_state = "🟢 运行中" if bridge["running"] else "🔴 未运行"
@@ -533,11 +549,15 @@ class Main(Star):
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
-            f"运行状态: {running}\n"
+            f"监听服务: {running}\n"
+            f"上次视频扫描: {listener['last_video_scan']}\n"
+            f"上次直播扫描: {listener['last_live_scan']}\n"
+            f"监听错误: {listener['last_error'] or '无'}\n"
+            f"{'=' * 20}\n"
             f"Cookie: {cookie_ok}\n"
             f"轮询间隔: {self.cfg.get('poll_interval', 60)}秒\n"
             f"直播监控: {'🟢 开启' if self.cfg.get('enable_live_monitor', True) else '🔴 关闭'}\n"
-            f"订阅总数: {total_subs}\n"
+            f"订阅总数: {total_subs} (视频 {video_subs} / 直播 {live_subs})\n"
             f"{'=' * 20}\n"
             f"amagi 桥接: {bridge_state} ({bridge['port']})\n"
             f"amagi 运行时: {amagi_ready} (v{bridge['amagi_version']})\n"

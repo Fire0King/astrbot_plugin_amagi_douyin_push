@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Optional
 
 from astrbot.api import logger
@@ -11,6 +12,9 @@ from ..core.douyin import get_live_snapshot, get_user_works
 from ..core.models import SubscriptionRecord
 from ..core.utils import build_user_url, build_video_url
 from .renderer import Renderer
+
+# 「桥接未就绪」提示的最小间隔(秒), 避免每个轮询周期刷屏
+_NOT_READY_LOG_INTERVAL = 300
 
 
 class DouyinListener:
@@ -37,38 +41,103 @@ class DouyinListener:
         self._video_task: Optional[asyncio.Task] = None
         self._live_task: Optional[asyncio.Task] = None
 
+        # 运行状态 (供 /dy_status 诊断)
+        self.last_video_scan_at: float = 0.0
+        self.last_live_scan_at: float = 0.0
+        self.last_error: str = ""
+        self._last_not_ready_log_at: float = 0.0
+
+    # ==================== 生命周期 ====================
+
     async def start(self):
-        """启动后台监听"""
-        if self._running:
+        """
+        启动后台监听 (幂等)。
+
+        注意: 判定「是否已在运行」必须以任务是否结束为准, 不能用 _running 标志 ——
+        任务被 cancel() 后标志可能仍是 True, 会导致新任务立即 return 而静默失效。
+        """
+        if self._video_task and not self._video_task.done():
+            logger.debug("抖音监听服务已在运行, 跳过重复启动")
             return
+
         self._running = True
-        logger.info("抖音监听服务已启动")
-
-        # 启动视频监控
-        self._video_task = asyncio.create_task(self._video_loop())
-        # 启动直播监控
-        if self.enable_live:
-            self._live_task = asyncio.create_task(self._live_loop())
-
-        # 等待任务（保持运行）
-        await asyncio.gather(
-            self._video_task,
-            self._live_task,
-            return_exceptions=True
+        logger.info(
+            f"抖音监听服务已启动 (间隔 {self.interval_secs}s, "
+            f"直播监控 {'开启' if self.enable_live else '关闭'})"
         )
 
+        self._video_task = asyncio.create_task(self._video_loop())
+        tasks = [self._video_task]
+        if self.enable_live:
+            self._live_task = asyncio.create_task(self._live_loop())
+            tasks.append(self._live_task)
+
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._running = False
+
     async def stop(self):
-        """停止后台监听"""
+        """停止后台监听 (等待任务真正结束, 避免与重启竞态)"""
         self._running = False
-        if self._video_task and not self._video_task.done():
-            self._video_task.cancel()
-        if self._live_task and not self._live_task.done():
-            self._live_task.cancel()
+        for task in (self._video_task, self._live_task):
+            if task is None or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"监听任务结束异常: {e}")
+        self._video_task = None
+        self._live_task = None
         logger.info("抖音监听服务已停止")
+
+    async def restart(self):
+        """重启监听: 先确认旧任务完全结束, 再启动新任务"""
+        await self.stop()
+        await self.start()
+
+    @property
+    def running(self) -> bool:
+        """监听循环是否真的在跑"""
+        return bool(self._video_task and not self._video_task.done())
+
+    def status_info(self) -> dict:
+        now = time.time()
+
+        def _ago(ts: float) -> str:
+            if not ts:
+                return "尚未扫描"
+            return f"{int(now - ts)} 秒前"
+
+        return {
+            "running": self.running,
+            "interval": self.interval_secs,
+            "enable_live": bool(self.enable_live),
+            "last_video_scan": _ago(self.last_video_scan_at),
+            "last_live_scan": _ago(self.last_live_scan_at),
+            "last_error": self.last_error,
+        }
 
     def _amagi_ready(self) -> bool:
         """桥接是否可提供服务 (Cookie 已配置且进程已就绪)"""
         return bool(self.amagi.cookie_configured and self.amagi.running and self.amagi.started)
+
+    def _log_not_ready(self):
+        """桥接不可用时给出可见原因 (限流, 避免刷屏)"""
+        now = time.time()
+        if now - self._last_not_ready_log_at < _NOT_READY_LOG_INTERVAL:
+            return
+        self._last_not_ready_log_at = now
+        info = self.amagi.status_info()
+        reason = info.get("last_error") or info.get("build_msg") or "未知"
+        logger.warning(
+            "amagi 桥接未就绪, 本轮跳过检查 "
+            f"(cookie={'已配置' if info.get('cookie_configured') else '未配置'}, "
+            f"running={info.get('running')}, started={info.get('started')}, 原因: {reason})"
+        )
 
     # ==================== 视频监控 ====================
 
@@ -81,11 +150,13 @@ class DouyinListener:
                     for record in records:
                         if record.sub_type == 'video':
                             await self._check_user_videos(sub_user, record)
+                self.last_video_scan_at = time.time()
                 await asyncio.sleep(self.interval_secs)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"视频监控循环出错: {e}")
+                self.last_error = f"视频监控循环出错: {e}"
+                logger.error(self.last_error)
                 await asyncio.sleep(10)
 
     async def _check_user_videos(self, sub_user: str, record: SubscriptionRecord):
@@ -96,14 +167,16 @@ class DouyinListener:
 
         try:
             await self.amagi.ensure_started()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ensure_started 异常: {e}")
         if not self._amagi_ready():
+            self._log_not_ready()
             return
 
         try:
             works = await get_user_works(self.amagi, sec_uid)
             if not works:
+                logger.debug(f"用户 {sec_uid} 作品列表为空, 跳过")
                 return
 
             # 构建已知 ID 集合（最后推送的 + 最近缓存的）
@@ -135,7 +208,10 @@ class DouyinListener:
                         recent_ids=[latest_id],
                         nickname=latest.get('author', {}).get('nickname', record.nickname)
                     )
-                    logger.info(f"首次记录用户 {sec_uid} 的最新视频: {latest_id}")
+                    logger.info(
+                        f"首次记录用户 {sec_uid} 的最新视频: {latest_id} "
+                        f"(仅记录基线, 不推送; 之后的更新才会推送)"
+                    )
                 return
 
             # 旧数据迁移：有 last_video_id 但 recent_ids 为空（升级前的老数据）
@@ -158,6 +234,9 @@ class DouyinListener:
             nickname = new_videos[-1].get('author', {}).get('nickname', record.nickname)
             new_ids = [str(w.get('aweme_id', '')) for w in new_videos]
             latest_id = new_ids[0]
+            logger.info(
+                f"检测到用户 {sec_uid} 更新 {len(new_videos)} 个新视频: {new_ids}"
+            )
 
             # 更新记录：last = 最新ID, recent_ids = 最近几条缓存
             updated_recent = list(dict.fromkeys(new_ids + [record.last_video_id] + (record.recent_ids or [])))[:5]
@@ -173,7 +252,8 @@ class DouyinListener:
                 await self._push_video_message(sub_user, record, work)
 
         except Exception as e:
-            logger.error(f"检查用户 {sec_uid} 视频失败: {e}")
+            self.last_error = f"检查用户 {sec_uid} 视频失败: {e}"
+            logger.error(self.last_error)
 
     async def _push_video_message(self, sub_user: str, record: SubscriptionRecord, work: dict):
         """推送视频消息"""
@@ -211,11 +291,13 @@ class DouyinListener:
                     for record in records:
                         if record.sub_type == 'live':
                             await self._check_live_status(sub_user, record)
+                self.last_live_scan_at = time.time()
                 await asyncio.sleep(self.interval_secs)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"直播监控循环出错: {e}")
+                self.last_error = f"直播监控循环出错: {e}"
+                logger.error(self.last_error)
                 await asyncio.sleep(10)
 
     async def _check_live_status(self, sub_user: str, record: SubscriptionRecord):
@@ -227,9 +309,10 @@ class DouyinListener:
 
         try:
             await self.amagi.ensure_started()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ensure_started 异常: {e}")
         if not self._amagi_ready():
+            self._log_not_ready()
             return
 
         try:
@@ -267,7 +350,8 @@ class DouyinListener:
                                               extra={"avatar": snap.get("avatar", "")})
 
         except Exception as e:
-            logger.error(f"检查直播状态失败 (sec_uid={sec_uid}): {e}")
+            self.last_error = f"检查直播状态失败 (sec_uid={sec_uid}): {e}"
+            logger.error(self.last_error)
 
     async def _push_live_message(self, sub_user: str, record: SubscriptionRecord, is_live: bool,
                                  title: str = "", extra: Optional[dict] = None):
