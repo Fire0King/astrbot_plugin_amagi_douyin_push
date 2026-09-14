@@ -43,6 +43,16 @@ def _first_url(media: Any) -> str:
         return ""
 
 
+def _to_int(value: Any) -> Optional[int]:
+    """尽力转 int; 无法转换(含 None/空串/异常类型)时返回 None"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ============================================================================
 # 用户资料
 # ============================================================================
@@ -103,18 +113,22 @@ async def get_live_snapshot(amagi, sec_uid: str) -> Optional[dict]:
     """
     轮询用户主页, 返回规范化的直播快照:
       {
-        "sec_uid":   str,
-        "nickname":  str,
-        "avatar":    str,
-        "is_live":   bool,
-        "room_id":   str,   # 用户直播间内部 id (room_id_str), 未开播也可能有值
-        "room_title":str,
-        "room_status": int | None,   # 主页能拿到的直播状态原始值, 便于排查
+        "sec_uid":     str,
+        "nickname":    str,
+        "avatar":      str,
+        "is_live":     bool,          # 仅在 status_known=True 时有意义
+        "status_known":bool,          # 是否真的读到了直播状态字段
+        "status_source":str,          # 判定所用字段: live_room.status / user.live_status
+        "room_id":     str,           # 用户直播间内部 id (room_id_str), 未开播也可能有值
+        "room_title":  str,
+        "room_status": int | None,    # 主页能拿到的直播状态原始值, 便于排查
       }
 
     判定逻辑:
-      1) 若主页返回 live_room 对象 (通常带 status=2/4), 用 room.status == 2 判定;
-      2) 否则用 user.live_status == 1 判定。
+      1) 若主页返回 live_room 对象且带 status (2=直播中/4=未开播), 用 room.status == 2 判定;
+      2) 否则用 user.live_status == 1 判定;
+      3) 两者都拿不到时 status_known=False —— 调用方应视为「状态未知」并跳过本轮,
+         不能当作「未开播」(否则会造成误报下播、来回刷屏)。
     """
     if not sec_uid:
         return None
@@ -128,40 +142,46 @@ async def get_live_snapshot(amagi, sec_uid: str) -> Optional[dict]:
     room_id = str(user.get("room_id_str") or user.get("room_id") or "")
 
     live_room = user.get("live_room")
-    raw_status = None
+    raw_status: Optional[int] = None
+    status_source = ""
     room_title = ""
 
     if isinstance(live_room, dict):
         # 个别版本的抖音在直播时会回填 live_room (含 status/title/cover)
-        room_status = live_room.get("status")
+        room_status = _to_int(live_room.get("status"))
         if room_status is not None:
             raw_status = room_status
+            status_source = "live_room.status"
             room_title = str(live_room.get("title") or "")
             if not room_id:
                 room_id = str(live_room.get("room_id_str") or live_room.get("room_id") or "")
 
     if raw_status is None:
-        raw_status = user.get("live_status")
+        user_live_status = _to_int(user.get("live_status"))
+        if user_live_status is not None:
+            raw_status = user_live_status
+            status_source = "user.live_status"
 
     # 判定 (语义见文件头注释, 真机实测后可在此微调)
-    if raw_status is not None:
-        is_live = (int(raw_status) == ROOM_STATUS_LIVE) if _has_room_live_room(live_room) \
-            else (int(raw_status) == USER_LIVE_STATUS_ON)
-    else:
+    # 注意: 两个字段都缺失/无法解析时 status_known=False, 此时**不能**当作「未开播」,
+    # 否则接口偶发缺字段会被误判成下播, 造成「下播↔开播」来回刷屏。
+    status_known = raw_status is not None
+    if not status_known:
         is_live = False
+    elif status_source == "live_room.status":
+        is_live = raw_status == ROOM_STATUS_LIVE
+    else:
+        is_live = raw_status == USER_LIVE_STATUS_ON
 
     return {
         "sec_uid": sec_uid,
         "nickname": nickname or sec_uid,
         "avatar": avatar,
         "is_live": is_live,
+        "status_known": status_known,
+        "status_source": status_source,
         "room_id": room_id,
         "room_title": room_title,
         "room_status": raw_status,
         "live_room": live_room if isinstance(live_room, dict) else None,
     }
-
-
-def _has_room_live_room(live_room: Any) -> bool:
-    """live_room 使用 webcast 的 2/4 语义时返回 True"""
-    return isinstance(live_room, dict) and live_room.get("status") is not None

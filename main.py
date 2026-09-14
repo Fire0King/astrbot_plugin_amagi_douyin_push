@@ -39,7 +39,7 @@ plugin_dir = Path(__file__).parent
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.2",
+    "1.0.3",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -359,7 +359,10 @@ class Main(Star):
                     title=snap.get("room_title") or "无标题",
                     extra={"avatar": snap.get("avatar", "")},
                 )
-                detail = f" (raw room_status={snap.get('room_status')})" if snap.get("room_status") is not None else ""
+                if snap.get("status_known"):
+                    detail = f"\n判定依据: {snap.get('status_source')}={snap.get('room_status')}"
+                else:
+                    detail = "\n⚠️ 未读到直播状态字段(live_room.status / user.live_status 均缺失)，无法判定"
                 yield event.plain_result(
                     f"✅ 直播状态: {status_text}{detail}\n"
                     f"👤 {nickname}\n测试消息已发送到当前会话"

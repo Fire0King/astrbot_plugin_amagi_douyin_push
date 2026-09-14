@@ -15,6 +15,7 @@ class SubscriptionRecord:
     last_video_id: Optional[str] = None  # 最后推送的视频ID
     # 直播监控状态
     is_live: bool = False               # 当前是否开播
+    live_checked: bool = False          # 是否已建立直播状态基线（首次观测只记录不推送）
     last_live_title: str = ""           # 上次直播标题
     room_id: str = ""                   # 直播间 room_id（由用户主页接口解析）
     # @全体成员 选项

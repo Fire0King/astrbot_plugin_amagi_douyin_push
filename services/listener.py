@@ -320,6 +320,12 @@ class DouyinListener:
             if not snap:
                 return
 
+            # 状态字段缺失(接口偶发不含直播状态) → 视为未知, 既不改状态也不推送,
+            # 否则会被误判成「下播」, 造成下播↔开播来回刷屏
+            if not snap.get("status_known", True):
+                logger.debug(f"直播状态未知, 跳过本轮 (sec_uid={sec_uid})")
+                return
+
             is_now_live = snap["is_live"]
             room_title = snap.get("room_title") or ""
 
@@ -330,6 +336,22 @@ class DouyinListener:
                     nickname=snap["nickname"],
                 )
 
+            # 首次观测只建立基线, 不推送
+            # (订阅时主播可能已经开播, 若直接推送会误报成「刚刚开播」)
+            if not record.live_checked:
+                self.data_manager.update_subscription(
+                    sub_user, record.uid, 'live',
+                    live_checked=True,
+                    is_live=is_now_live,
+                    last_live_title=room_title or record.last_live_title,
+                )
+                logger.info(
+                    f"首次记录用户 {sec_uid} 的直播状态: "
+                    f"{'直播中' if is_now_live else '未开播'} "
+                    f"(仅记录基线, 不推送; 之后的状态变化才会推送)"
+                )
+                return
+
             if is_now_live and not record.is_live:
                 # 开播了！
                 self.data_manager.update_subscription(
@@ -337,6 +359,7 @@ class DouyinListener:
                     is_live=True,
                     last_live_title=room_title,
                 )
+                logger.info(f"检测到用户 {sec_uid} 开播: {room_title or '无标题'}")
                 await self._push_live_message(sub_user, record, True, room_title,
                                               extra={"avatar": snap.get("avatar", "")})
 
@@ -346,6 +369,7 @@ class DouyinListener:
                     sub_user, record.uid, 'live',
                     is_live=False,
                 )
+                logger.info(f"检测到用户 {sec_uid} 下播")
                 await self._push_live_message(sub_user, record, False, record.last_live_title,
                                               extra={"avatar": snap.get("avatar", "")})
 
@@ -358,13 +382,13 @@ class DouyinListener:
         """推送直播消息"""
         extra = extra or {}
 
-        # 使用渲染器生成消息（返回文本 + 可选图片）
-        text, img_path = await self.renderer.render_live(
-            record, is_live, title,
-            avatar=extra.get("avatar", ""),
-        )
-
         try:
+            # 使用渲染器生成消息（返回文本 + 可选图片）
+            text, img_path = await self.renderer.render_live(
+                record, is_live, title,
+                avatar=extra.get("avatar", ""),
+            )
+
             # 构建 MessageChain
             chain = MessageChain()
             if is_live and (record.live_atall or record.at_all):
@@ -379,4 +403,5 @@ class DouyinListener:
             await self.context.send_message(sub_user, chain)
             logger.info(f"已向 {sub_user} 推送直播状态: {'开播' if is_live else '下播'}")
         except Exception as e:
-            logger.error(f"推送直播消息失败: {e}")
+            self.last_error = f"推送直播消息失败: {e}"
+            logger.error(self.last_error)
