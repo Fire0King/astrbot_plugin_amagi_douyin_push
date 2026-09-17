@@ -19,6 +19,23 @@ from ..core.utils import build_live_url, build_video_url, first_url, format_numb
 # 插件根目录
 plugin_dir = Path(__file__).resolve().parent.parent
 
+# ==================== 卡片渲染选项 ====================
+#
+# 为什么不用「PNG + 高分屏放大」：
+#   推送图片时, 图片由 AstrBot 读成 base64 交给协议端(NapCat), 再由 QQ 上传到
+#   腾讯富媒体服务器。图片体积过大时这一步会直接失败, 报
+#   `rich media transfer failed` (retcode 1200), 整条推送(含链接)一起丢。
+# 因此这里刻意选更小的输出:
+#   - type=jpeg      : 无损 PNG 的体积通常是 JPEG 的数倍
+#   - scale=css      : 不再按高分屏放大(device/ultra), 避免渲染出 2~3 倍分辨率的巨图
+# 若仍偶发失败, 可把 quality 继续下调(如 50)进一步减小体积。
+CARD_RENDER_OPTIONS = {
+    "full_page": True,
+    "type": "jpeg",
+    "quality": 75,
+    "scale": "css",
+}
+
 # ==================== 纯文本消息模板 ====================
 
 VIDEO_TEXT_TEMPLATE = """📹 新视频发布
@@ -71,19 +88,23 @@ class Renderer:
                 tmpl=tmpl_str,
                 data=data,
                 return_url=False,
-                options={
-                    "full_page": True,
-                    "type": "png",
-                    "scale": "device",
-                    "device_scale_factor_level": "ultra",
-                }
+                options=CARD_RENDER_OPTIONS,
             )
             if img_path:
-                logger.info(f"卡片渲染成功: {img_path}")
+                logger.info(f"卡片渲染成功: {img_path}{self._size_hint(img_path)}")
             return img_path
         except Exception as e:
             logger.warning(f"卡片渲染失败，降级为纯文本: {e}")
             return None
+
+    @staticmethod
+    def _size_hint(img_path: str) -> str:
+        """渲染结果的文件大小提示 (图片体积过大是协议端推送失败的常见原因)"""
+        try:
+            size_kb = Path(img_path).stat().st_size / 1024
+        except OSError:
+            return ""
+        return f" ({size_kb:.0f} KB)"
 
     async def render_video(self, work: dict, nickname: str = "") -> Tuple[str, Optional[str]]:
         """

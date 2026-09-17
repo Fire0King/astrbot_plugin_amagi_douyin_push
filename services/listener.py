@@ -293,6 +293,27 @@ class DouyinListener:
             nickname=latest[3].get('author', {}).get('nickname', record.nickname),
         )
 
+    @staticmethod
+    def _build_text_chain(at_all: bool, text: str) -> MessageChain:
+        """构建纯文本消息链 (图片发送失败时的降级方案)"""
+        chain = MessageChain()
+        if at_all:
+            chain.at_all()
+        chain.message(text)
+        return chain
+
+    async def _send_text_fallback(self, sub_user: str, at_all: bool, text: str, err: Exception):
+        """
+        图片发送失败时降级为纯文本重发, 保证推送不丢。
+
+        图片推送失败在协议端很常见, 例如 QQ 富媒体上传失败
+        (`rich media transfer failed`, retcode 1200)。
+        由于图片与链接在同一条消息链里, 失败会导致**整条推送**丢失,
+        因此这里用带链接的纯文本兜底重发。
+        """
+        logger.warning(f"卡片图片发送失败, 降级为纯文本重发: {err}")
+        await self.context.send_message(sub_user, self._build_text_chain(at_all, text))
+
     async def _push_video_message(self, sub_user: str, record: SubscriptionRecord, work: dict):
         """推送视频消息"""
         try:
@@ -302,18 +323,23 @@ class DouyinListener:
             # 使用渲染器生成消息（返回文本 + 可选图片）
             text, img_path = await self.renderer.render_video(work, nickname)
 
-            # 构建 MessageChain
-            chain = MessageChain()
-            if record.at_all:
-                chain.at_all()
             if img_path:
+                # 构建 MessageChain
+                chain = MessageChain()
+                if record.at_all:
+                    chain.at_all()
                 chain.file_image(img_path)
                 url = build_video_url(aweme_id)
                 chain.message(f"\n{url}")
+                try:
+                    await self.context.send_message(sub_user, chain)
+                except Exception as e:  # noqa: BLE001
+                    await self._send_text_fallback(sub_user, record.at_all, text, e)
             else:
-                chain.message(text)
+                await self.context.send_message(
+                    sub_user, self._build_text_chain(record.at_all, text)
+                )
 
-            await self.context.send_message(sub_user, chain)
             logger.info(f"已向 {sub_user} 推送视频: {aweme_id}")
         except Exception as e:
             logger.error(f"推送视频消息失败: {e}")
@@ -427,18 +453,25 @@ class DouyinListener:
                 avatar=extra.get("avatar", ""),
             )
 
-            # 构建 MessageChain
-            chain = MessageChain()
-            if is_live and (record.live_atall or record.at_all):
-                chain.at_all()
+            at_all = is_live and (record.live_atall or record.at_all)
+
             if img_path:
+                # 构建 MessageChain
+                chain = MessageChain()
+                if at_all:
+                    chain.at_all()
                 chain.file_image(img_path)
                 url = build_user_url(record.sec_uid)
                 chain.message(f"\n{url}")
+                try:
+                    await self.context.send_message(sub_user, chain)
+                except Exception as e:  # noqa: BLE001
+                    await self._send_text_fallback(sub_user, at_all, text, e)
             else:
-                chain.message(text)
+                await self.context.send_message(
+                    sub_user, self._build_text_chain(at_all, text)
+                )
 
-            await self.context.send_message(sub_user, chain)
             logger.info(f"已向 {sub_user} 推送直播状态: {'开播' if is_live else '下播'}")
         except Exception as e:
             self.last_error = f"推送直播消息失败: {e}"
