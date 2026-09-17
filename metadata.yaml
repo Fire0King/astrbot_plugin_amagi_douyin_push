@@ -2,7 +2,7 @@ name: astrbot_plugin_amagi_douyin_push
 display_name: 抖音推送
 desc: 基于 amagi 数据源的抖音监控推送插件，实时推送订阅用户的视频发布与直播上下播通知到指定会话。
 short_desc: 抖音视频更新与直播上下播实时推送
-version: v1.0.4
+version: v1.0.5
 author: Fire_King
 repo: https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push
 astrbot_version: ">=4.16,<5"
