@@ -71,7 +71,7 @@ _PROBE_PNG_B64 = _build_probe_png()
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.6",
+    "1.0.7",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -583,7 +583,7 @@ class Main(Star):
         bridge_err = bridge["last_error"] or bridge["build_msg"]
 
         card_state = "🟢 开启" if self.cfg.get('rai', False) else "🔴 关闭(纯文本)"
-        last_card = (f"{self.renderer.last_card_size / 1024:.0f} KB"
+        last_card = (f"{self.renderer.last_card_format}, {self.renderer.last_card_size / 1024:.0f} KB"
                      if self.renderer.last_card_size else "无(本进程未成功渲染)")
 
         msg = (
@@ -643,6 +643,7 @@ class Main(Star):
         card_ok: Optional[bool] = None
         path = self.renderer.last_card_path
         size_kb = self.renderer.last_card_size / 1024
+        card_label = f"上次卡片图 ({self.renderer.last_card_format or '格式未知'}, {size_kb:.0f} KB)"
         if path and Path(path).exists():
             try:
                 await self.context.send_message(
@@ -650,10 +651,10 @@ class Main(Star):
                     MessageChain([CompImage.fromFileSystem(path)]),
                 )
                 card_ok = True
-                lines.append(f"上次卡片图 ({size_kb:.0f} KB): ✅ 发送成功")
+                lines.append(f"{card_label}: ✅ 发送成功")
             except Exception as e:  # noqa: BLE001
                 card_ok = False
-                lines.append(f"上次卡片图 ({size_kb:.0f} KB): ❌ {self._brief_err(e)}")
+                lines.append(f"{card_label}: ❌ {self._brief_err(e)}")
         else:
             lines.append("上次卡片图: ⏭ 无本地缓存 (本进程还没成功渲染过卡片)")
 
@@ -666,16 +667,20 @@ class Main(Star):
             )
         elif tiny_ok and card_ok is False:
             lines.append(
-                "结论: 小图能发、卡片图发不出 → 是图片体积/规格问题, "
-                "把 services/renderer.py 里 CARD_RENDER_OPTIONS 的 quality 调低(如 50)后再试。"
+                f"结论: 小图能发、卡片图发不出 → 是卡片图本身的问题 ({card_label})。"
+                "若格式为 PNG/JPEG 等常见格式, 说明是体积过大 → 调低 services/renderer.py 里 "
+                "CARD_RENDER_OPTIONS 的 quality(如 50), 或缩小卡片宽度; "
+                "若格式为「格式未知」, 说明 t2i 渲染服务返回的不是图片, 请检查 AstrBot 的文转图设置。"
             )
         elif tiny_ok and card_ok:
             lines.append(
-                "结论: 图片通道正常, 之前的失败多为瞬时问题(网络抖动/风控/上传超时), 可继续观察。"
+                f"结论: 小图与卡片图 ({card_label}) 都能发出 → 通道正常, "
+                "之前的失败多为瞬时问题(网络抖动/上传超时), 可继续观察。"
             )
         else:
             lines.append(
-                "结论: 极小图片可正常发送; 要判定卡片图, 请等一次真实推送渲染出卡片后重跑本命令。"
+                "结论: 极小图片可正常发送; 要判定卡片图, 请先执行 /dy_test <抖音用户> "
+                "(或等一次真实推送)渲染出卡片, 再重跑本命令。"
             )
 
         yield event.plain_result("\n".join(lines))
