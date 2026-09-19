@@ -97,5 +97,15 @@
         "description": "重连静默：距上次成功推送超过 6 小时（如断电/断网/长期失败）时，恢复后先静默一个轮询周期，避免积压的更新一次性刷屏",
         "type": "bool",
         "default": false
+    },
+    "enable_bilibili": {
+        "description": "B站监控（附属功能）：开启后可用 /bili_sub 订阅 UP 主的新投稿与开播/下播",
+        "type": "bool",
+        "default": false
+    },
+    "bilibili_cookie": {
+        "description": "B站凭据（附属功能）：留空时会自动借用 bilibili 插件已保存的凭据；也可手动填 SESSDATA=xxx; bili_jct=xxx; buvid3=xxx",
+        "type": "string",
+        "default": ""
     }
 }

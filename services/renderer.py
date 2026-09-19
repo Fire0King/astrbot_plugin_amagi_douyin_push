@@ -62,6 +62,21 @@ LIVE_START_TEXT = """🔴 {nickname} 开播啦！
 LIVE_END_TEXT = """⚫ {nickname} 已下播
 📺 本次直播: {title}"""
 
+# ==================== B 站纯文本模板 ====================
+
+BILI_VIDEO_TEXT = """📺 {nickname} 发布了新视频
+📝 {title}
+▶️ {play}  💬 {danmaku}  ⏱ {duration}
+🔗 {url}"""
+
+BILI_LIVE_START_TEXT = """🔴 {nickname} 开播啦！
+📺 {title}
+🔗 {url}"""
+
+BILI_LIVE_END_TEXT = """⚫ {nickname} 已下播
+📺 本次直播: {title}
+🔗 {url}"""
+
 
 class Renderer:
     """消息渲染器"""
@@ -104,26 +119,36 @@ class Renderer:
             logger.error(f"加载模板 {name} 失败: {e}")
             return None
 
-    async def _render_card(self, tmpl_name: str, data: dict,
+    async def _render_card(self, tmpl_name: Optional[str], data: dict,
                            local_kind: str = "video") -> Optional[str]:
         """
         渲染卡片图片(按 card_engine 分派)。
 
-        local: Pillow 本地自绘 —— 内存 ~30MB、单张 ~30ms、不依赖任何外部服务,
+        local: Pillow 本地自绘 —— 内存 ~30MB、单张 ~0.2s、不依赖任何外部服务,
                小内存机器上的默认选择。
         html : AstrBot 内置 html_render(远程 t2i 服务), 带「校验 + 重试」。
+
+        tmpl_name 为 None 表示该卡片只有本地实现(B 站卡片就是这种), 此时即使
+        card_engine=html 也走本地渲染; 若本地渲染器不可用则返回 None, 由调用方降级为纯文本。
         """
         if not self.rai:
             return None
-        if self.engine == "html" or self.cards is None:
+        if self.cards is not None and (self.engine == "local" or not tmpl_name):
+            return await self._render_card_local(local_kind, data)
+        if tmpl_name:
             return await self._render_card_html(tmpl_name, data)
-        return await self._render_card_local(local_kind, data)
+        logger.warning("本地卡片渲染器不可用, 且该卡片没有 HTML 模板, 本次降级为纯文本")
+        return None
 
     async def _render_card_local(self, kind: str, data: dict) -> Optional[str]:
         """本地 Pillow 自绘(阻塞操作已在线程池里执行)"""
         try:
             if kind == "live":
                 img_path = await self.cards.arender_live_card(data)
+            elif kind == "bili_video":
+                img_path = await self.cards.arender_bili_video_card(data)
+            elif kind == "bili_live":
+                img_path = await self.cards.arender_bili_live_card(data)
             else:
                 img_path = await self.cards.arender_video_card(data)
             if img_path:
@@ -274,6 +299,72 @@ class Renderer:
         }, local_kind="live")
 
         return text, img_path
+
+    # ---------------- B 站消息 ----------------
+
+    async def render_bili_video(self, video: dict) -> Tuple[str, Optional[str]]:
+        """
+        渲染 B 站投稿视频消息。返回 (消息文本, 可选的图片路径)
+
+        video 为 core.bilibili.extract_video() 归一化后的结构。
+        """
+        author = video.get("author") or {}
+        nickname = author.get("name") or "B站UP主"
+        title = video.get("title") or "无标题"
+        desc = str(video.get("desc") or "").strip()
+        url = video.get("url") or ""
+        play = str(video.get("play") or "0")
+        danmaku = str(video.get("danmaku") or "0")
+        duration = str(video.get("duration") or "")
+
+        text = BILI_VIDEO_TEXT.format(
+            nickname=nickname, title=title, play=play,
+            danmaku=danmaku, duration=duration or "-", url=url,
+        )
+        img_path = await self._render_card(None, {
+            "nickname": nickname,
+            "avatar": author.get("face") or "",
+            "cover": video.get("cover") or "",
+            "title": title,
+            "desc": desc[:60],
+            "play": play,
+            "danmaku": danmaku,
+            "duration": duration,
+            "url": url,
+        }, local_kind="bili_video")
+        return text, img_path
+
+    async def render_bili_live(self, record, is_live: bool, title: str = "",
+                               cover: str = "", avatar: str = "") -> Tuple[str, Optional[str]]:
+        """渲染 B 站开播/下播消息。返回 (消息文本, 可选的图片路径)"""
+        nickname = record.nickname or record.uid
+        room_id = getattr(record, "room_id", "") or ""
+        url = (f"https://live.bilibili.com/{room_id}" if room_id
+               else f"https://space.bilibili.com/{record.uid}")
+
+        text = (BILI_LIVE_START_TEXT if is_live else BILI_LIVE_END_TEXT).format(
+            nickname=nickname, title=title or "无标题", url=url,
+        )
+        img_path = await self._render_card(None, {
+            "nickname": nickname,
+            "title": title or "无标题",
+            "cover": cover or "",
+            "avatar": avatar or "",
+            "url": url,
+            "is_live": is_live,
+        }, local_kind="bili_live")
+        return text, img_path
+
+    def render_bili_user_info(self, card: dict) -> str:
+        """B 站用户信息（仅纯文本）"""
+        fans = card.get("fans")
+        sign = str(card.get("sign") or "").replace("\n", " ")[:50]
+        return (
+            f"👤 {card.get('name') or '未知'}\n"
+            f"📝 {sign or '这个人很懒，什么都没写'}\n"
+            f"👥 粉丝: {format_number(fans) if fans is not None else '未知'}\n"
+            f"🔗 https://space.bilibili.com/{card.get('mid') or ''}"
+        )
 
     def render_user_info(self, user: UserInfo) -> str:
         """渲染用户信息（仅纯文本）"""

@@ -28,6 +28,7 @@ const pluginRoot = path.resolve(__dirname, '..')
 const env = process.env
 const amagiDir = env.AMAGI_DIR ? path.resolve(env.AMAGI_DIR) : path.join(pluginRoot, '.amagi')
 const cookie = env.DOUYIN_COOKIE || ''
+const bilibiliCookie = env.BILIBILI_COOKIE || ''
 const port = Number.parseInt(env.AMAGI_PORT || '48211', 10)
 
 const ENTRY_CANDIDATES = [
@@ -119,7 +120,8 @@ async function main() {
   let client
   try {
     client = createClient({
-      cookies: { douyin: cookie },
+      // amagi 的 cookies 按平台传入; B 站部分作为附属功能, 未配置时留空
+      cookies: { douyin: cookie, bilibili: bilibiliCookie },
     })
   } catch (err) {
     return fail(`创建 amagi 客户端失败: ${err?.message ?? err}`)
@@ -167,7 +169,10 @@ async function main() {
   // 当成自己的桥接已就绪。
   setTimeout(() => {
     ready = true
-    console.log(`[amagi-bridge] ready port=${port} cookie=${cookie ? 'configured' : 'empty'}`)
+    console.log(
+      `[amagi-bridge] ready port=${port} cookie=${cookie ? 'configured' : 'empty'}` +
+        ` bilibili=${bilibiliCookie ? 'configured' : 'empty'}`,
+    )
   }, 300)
 
   // 兜底: 其它异步错误直接退出, 由 Python 侧捕获

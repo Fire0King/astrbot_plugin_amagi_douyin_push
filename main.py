@@ -9,6 +9,12 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.event.filter import command, permission_type, PermissionType
 from astrbot.core.star.filter.command import GreedyStr
 
+from .core.bilibili import (
+    get_live_snapshot as get_bili_live_snapshot,
+    get_user_card as get_bili_user_card,
+    get_user_videos as get_bili_user_videos,
+    parse_mid,
+)
 from .core.data_manager import DataManager
 from .core.douyin import (
     get_create_time,
@@ -34,6 +40,51 @@ RECONNECT_SILENT_THRESHOLD_SECS = 6 * 3600
 # 静默时长 = 一个轮询周期 + 该余量
 RECONNECT_SILENT_PADDING_SECS = 60
 
+# ==================== B 站凭据 ====================
+# B 站凭据里需要的字段(SESSDATA 必填, 其余用于通过风控)
+_BILI_COOKIE_KEYS = ("sessdata", "bili_jct", "buvid3", "dedeuserid", "buvid4", "sid")
+
+
+def _extract_bili_cookie_from_file(path: Path) -> str:
+    """
+    从 bilibili 插件的数据文件里提取 B 站凭据, 拼成 Cookie 串。
+
+    只取已知字段, 不打印任何值; 文件不存在/结构不符时返回空串。
+    """
+    import json as _json
+
+    if not path or not path.exists():
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:   # 兼容 BOM
+            data = _json.load(f)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            lower = {str(k).lower(): v for k, v in obj.items()}
+            sessdata = lower.get("sessdata")
+            if isinstance(sessdata, str) and sessdata.strip():
+                pairs = []
+                for key in _BILI_COOKIE_KEYS:
+                    val = lower.get(key)
+                    if isinstance(val, str) and val.strip():
+                        name = "SESSDATA" if key == "sessdata" else key
+                        pairs.append(f"{name}={val.strip()}")
+                if pairs:
+                    found.append("; ".join(pairs))
+            for val in obj.values():
+                walk(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                walk(val)
+
+    walk(data)
+    return found[0] if found else ""
+
 # ==================== 数据源说明 ====================
 # 本插件的数据源为 amagi (https://github.com/ikenxuan/amagi, Node.js SDK):
 #   - amagi 不再以 git 子模块分发 (WebUI 安装不会拉子模块, 会导致目录为空),
@@ -48,7 +99,7 @@ RECONNECT_SILENT_PADDING_SECS = 60
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.2.2",
+    "1.3.0",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -65,6 +116,10 @@ class Main(Star):
         cookie = (self.cfg.get("douyin_cookie", "").strip()
                   or self.cfg.get("douyin_live_cookie", "").strip())
         self.amagi.set_cookie(cookie)
+        # B 站凭据(附属功能): 可直接粘贴 SESSDATA=...; bili_jct=... 或整段 Cookie;
+        # 留空时若开启了 enable_bilibili, 会尝试从 bilibili 插件的数据里借用
+        self.enable_bilibili = bool(self.cfg.get("enable_bilibili", False))
+        self.amagi.set_bilibili_cookie(self._resolve_bilibili_cookie())
 
         # 3. 初始化渲染器
         self.rai = self.cfg.get("rai", False)
@@ -117,6 +172,44 @@ class Main(Star):
             return
         self._last_notify_write_ts = now_ts
         self.data_manager.set_last_success_sub_notify_ts(now_ts)
+
+    def _resolve_bilibili_cookie(self) -> str:
+        """
+        取得 B 站凭据。
+
+        优先级: 插件配置 bilibili_cookie > 借用 bilibili 插件已保存的凭据(免配置)。
+        未开启 enable_bilibili 时直接返回空串(不读别人的数据)。
+        """
+        explicit = str(self.cfg.get("bilibili_cookie", "") or "").strip()
+        if explicit:
+            return explicit
+        if not self.enable_bilibili:
+            return ""
+
+        try:
+            from astrbot.api.star import StarTools
+            data_dir = Path(StarTools.get_data_dir(
+                plugin_name="astrbot_plugin_amagi_douyin_push"))
+            candidates = [
+                data_dir.parent / "astrbot_plugin_bilibili" / "astrbot_plugin_bilibili.json",
+                data_dir.parent.parent / "config" / "astrbot_plugin_bilibili_config.json",
+            ]
+            for path in candidates:
+                cookie = _extract_bili_cookie_from_file(path)
+                if cookie:
+                    logger.info(
+                        f"B站凭据: 已从 bilibili 插件数据借用 ({path.name}), "
+                        f"含 {len(cookie.split('; '))} 个字段 (不回显)"
+                    )
+                    return cookie
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"借用 bilibili 插件凭据失败: {e}")
+
+        logger.warning(
+            "B站监控已开启, 但未找到可用凭据 —— 请在插件配置里填写 bilibili_cookie "
+            "(SESSDATA=...; bili_jct=...; buvid3=...), 或确保 bilibili 插件已登录"
+        )
+        return ""
 
     def _configure_reconnect_silent(self) -> None:
         """
@@ -358,6 +451,180 @@ class Main(Star):
 
         yield event.plain_result("\n".join(msg_parts))
 
+    # ==================== B 站命令 (附属功能) ====================
+
+    def _bili_unavailable_msg(self) -> str:
+        """B 站功能不可用时的提示 (未开启 / 缺凭据)"""
+        if not self.enable_bilibili:
+            return (
+                "❌ B站监控未开启。\n"
+                "请在插件配置里打开 enable_bilibili 并准备好 B 站凭据"
+                "(填 bilibili_cookie, 或让 bilibili 插件保持登录以便自动借用), 然后重载插件。"
+            )
+        if not self.amagi.bilibili_cookie_configured:
+            return (
+                "❌ B站凭据缺失: 请在插件配置里填写 bilibili_cookie "
+                "(形如 SESSDATA=xxx; bili_jct=xxx; buvid3=xxx), 或让 bilibili 插件保持登录。"
+            )
+        return ""
+
+    @command("bili_sub")
+    async def bili_sub(self, event: AstrMessageEvent, raw_args: GreedyStr):
+        """
+        订阅 B 站 UP 主的新投稿与开播/下播（附属功能）。
+
+        用法:
+          /bili_sub <UID|主页URL> [at_all|live_atall]  — 投稿+直播
+          /bili_sub video <UID|主页URL> [at_all]       — 仅投稿
+          /bili_sub live <UID|主页URL> [live_atall]    — 仅直播
+        """
+        sub_user = event.unified_msg_origin
+        warn = self._bili_unavailable_msg()
+        if warn:
+            yield event.plain_result(warn)
+            return
+
+        args = raw_args.strip().split() if raw_args.strip() else []
+        if not args:
+            yield event.plain_result(
+                "❌ 请提供 B 站 UID 或主页链接。\n"
+                "用法:\n"
+                "  /bili_sub <UID|主页URL> [at_all|live_atall]  # 投稿+直播\n"
+                "  /bili_sub video <UID|主页URL> [at_all]       # 仅投稿\n"
+                "  /bili_sub live <UID|主页URL> [live_atall]    # 仅直播\n"
+                "示例: /bili_sub https://space.bilibili.com/525972018 at_all"
+            )
+            return
+
+        at_all = 'at_all' in args
+        live_atall = 'live_atall' in args
+        if (at_all or live_atall) and not event.is_admin():
+            yield event.plain_result("❌ 权限不足：只有管理员可以设置 @全体成员 相关选项。")
+            return
+
+        filtered = [a for a in args if a not in ('at_all', 'live_atall')]
+        sub_type = 'both'
+        target = filtered[0]
+        if target in ('video', 'live', 'both') and len(filtered) > 1:
+            sub_type = target
+            target = filtered[1]
+
+        mid = parse_mid(target)
+        if not mid:
+            yield event.plain_result(
+                "❌ 未识别到有效的 B 站 UID。\n"
+                "请提供数字 UID（如 525972018）或主页链接（https://space.bilibili.com/525972018）"
+            )
+            return
+
+        # 取昵称(顺带验证凭据是否可用)
+        nickname = mid
+        try:
+            card = await get_bili_user_card(self.amagi, mid)
+            if card:
+                nickname = str(card.get("name") or mid)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"获取 B 站用户名片失败: {e}")
+
+        results = []
+        if sub_type in ('video', 'both'):
+            _, msg = await self.subscription_service.add_subscription(
+                sub_user, mid, 'video',
+                nickname=nickname,
+                at_all=at_all,
+                platform='bilibili',
+            )
+            results.append(msg)
+
+        if sub_type in ('live', 'both'):
+            room_id = ""
+            try:
+                snap = await get_bili_live_snapshot(self.amagi, mid)
+                room_id = str(snap.get("room_id") or "") if snap else ""
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"获取 B 站直播间信息失败: {e}")
+            _, msg = await self.subscription_service.add_subscription(
+                sub_user, mid, 'live',
+                nickname=nickname,
+                room_id=room_id,
+                at_all=at_all,
+                live_atall=live_atall,
+                platform='bilibili',
+            )
+            results.append(msg)
+
+        await self._restart_listener()
+        yield event.plain_result("\n".join(results))
+
+    @command("bili_unsub")
+    async def bili_unsub(self, event: AstrMessageEvent, raw_args: GreedyStr):
+        """取消 B 站订阅。用法: /bili_unsub <UID> [video/live]"""
+        sub_user = event.unified_msg_origin
+        args = raw_args.strip().split(None, 1) if raw_args.strip() else []
+        if not args:
+            yield event.plain_result("❌ 请提供要取消订阅的 UID。\n用法: /bili_unsub <UID> [video/live]")
+            return
+
+        uid = parse_mid(args[0]) or args[0]
+        sub_type = args[1] if len(args) > 1 else None
+
+        if sub_type:
+            success, msg = await self.subscription_service.remove_subscription(
+                sub_user, uid, sub_type, 'bilibili')
+            if success:
+                await self._restart_listener()
+            yield event.plain_result(msg)
+            return
+
+        results = []
+        removed = False
+        for st in ('video', 'live'):
+            success, msg = await self.subscription_service.remove_subscription(
+                sub_user, uid, st, 'bilibili')
+            results.append(msg)
+            removed = removed or success
+        if removed:
+            await self._restart_listener()
+        yield event.plain_result("\n".join(results))
+
+    @command("bili_list", alias={"B站订阅列表"})
+    async def bili_list(self, event: AstrMessageEvent):
+        """列出当前会话的 B 站订阅"""
+        sub_user = event.unified_msg_origin
+        records = await self.subscription_service.list_subscriptions(sub_user, 'bilibili')
+        if not records:
+            yield event.plain_result("📋 当前没有 B 站订阅")
+            return
+
+        msg_parts = ["📋 B站订阅列表\n"]
+        for i, r in enumerate(records, 1):
+            type_tag = "📺投稿" if r.sub_type == 'video' else "🔴直播"
+            status = " 🟢直播中" if r.is_live else ""
+            at_tag = " [@全体]" if r.at_all else (" [开播@全体]" if r.live_atall else "")
+            msg_parts.append(f"{i}. {type_tag} {r.nickname or r.uid}{at_tag}{status}")
+        yield event.plain_result("\n".join(msg_parts))
+
+    @command("bili_info")
+    async def bili_info(self, event: AstrMessageEvent, raw_args: GreedyStr):
+        """查询 B 站 UP 主信息。用法: /bili_info <UID|主页URL>"""
+        warn = self._bili_unavailable_msg()
+        if warn:
+            yield event.plain_result(warn)
+            return
+        mid = parse_mid(raw_args.strip())
+        if not mid:
+            yield event.plain_result("❌ 请提供 B 站 UID 或主页链接。用法: /bili_info 525972018")
+            return
+        try:
+            card = await get_bili_user_card(self.amagi, mid)
+        except Exception as e:  # noqa: BLE001
+            yield event.plain_result(f"❌ 查询失败: {e}")
+            return
+        if not card:
+            yield event.plain_result("❌ 未获取到该 UP 主信息（UID 是否正确 / 凭据是否有效）")
+            return
+        yield event.plain_result(self.renderer.render_bili_user_info(card))
+
     @command("dy_test")
     async def dy_test(self, event: AstrMessageEvent, raw_args: GreedyStr):
         """
@@ -462,6 +729,117 @@ class Main(Star):
             logger.error(f"测试失败: {e}")
             yield event.plain_result(f"❌ 测试失败: {str(e)}")
 
+    @command("bili_test")
+    async def bili_test(self, event: AstrMessageEvent, raw_args: GreedyStr):
+        """
+        测试 B 站订阅功能。获取指定 UP 主的最新投稿/直播状态并推送测试消息，不保存订阅信息。
+
+        用法:
+          /bili_test <UID|主页URL>         — 测试投稿推送
+          /bili_test live <UID|主页URL>    — 测试直播状态
+        """
+        args = raw_args.strip().split(None, 1) if raw_args.strip() else []
+        if not args:
+            yield event.plain_result(
+                "❌ 请提供 B 站 UID 或主页URL。\n"
+                "用法: /bili_test <UID> 或 /bili_test live <UID>"
+            )
+            return
+
+        warn = self._bili_unavailable_msg()
+        if warn:
+            yield event.plain_result(warn)
+            return
+
+        sub_user = event.unified_msg_origin
+        is_live_test = (args[0] == 'live' and len(args) > 1)
+        target = args[1] if is_live_test else args[0]
+
+        mid = parse_mid(target)
+        if not mid:
+            yield event.plain_result("❌ 无法识别 UID，请提供 B 站主页链接或纯数字 UID")
+            return
+
+        try:
+            await self.amagi.ensure_started()
+        except Exception as e:
+            logger.debug(f"amagi 桥接启动失败: {e}")
+
+        if not (self.amagi.running and self.amagi.started):
+            status = self.amagi.status_info()
+            yield event.plain_result(
+                f"❌ amagi 桥接未就绪, 无法测试。\n"
+                f"状态: {status.get('build_msg', '未知')}\n"
+                f"错误: {status.get('last_error') or '无'}"
+            )
+            return
+
+        try:
+            # 昵称/头像取自用户名片(直播接口不带这些字段), 取不到就退化成 UID
+            nickname = mid
+            avatar = ""
+            try:
+                card = await get_bili_user_card(self.amagi, mid)
+                if card:
+                    nickname = str(card.get("name") or mid)
+                    avatar = str(card.get("face") or "")
+            except Exception as e:
+                logger.debug(f"获取B站用户名片失败: {e}")
+
+            if is_live_test:
+                yield event.plain_result(f"⏳ 正在查询 UP 主 {nickname} 的直播状态...")
+                snap = await get_bili_live_snapshot(self.amagi, mid)
+                if not snap:
+                    yield event.plain_result("❌ 获取直播信息失败，请检查 B 站凭据是否有效")
+                    return
+
+                is_live = bool(snap.get("is_live"))
+                record = SubscriptionRecord(
+                    sub_user=sub_user, uid=mid, sub_type='live', platform='bilibili',
+                    nickname=nickname, room_id=str(snap.get("room_id") or ""),
+                )
+                await self.listener._push_bili_live_message(
+                    sub_user, record, is_live,
+                    snap.get("room_title") or "无标题",
+                    cover=snap.get("cover", ""),
+                )
+                if snap.get("status_known"):
+                    detail = f"\n判定依据: {snap.get('status_source')} (状态已知)"
+                else:
+                    detail = "\n⚠️ 未读到直播状态字段, 无法判定开播/下播"
+                yield event.plain_result(
+                    f"✅ 直播状态: {'🟢 直播中' if is_live else '⭕ 未开播'}{detail}\n"
+                    f"👤 {nickname} (UID {mid})\n测试消息已发送到当前会话"
+                )
+
+            else:
+                yield event.plain_result(f"⏳ 正在查询 UP 主 {nickname} 的最新投稿...")
+                videos = await get_bili_user_videos(self.amagi, mid)
+                if not videos:
+                    yield event.plain_result("❌ 未获取到投稿数据，请检查 B 站凭据或 UID 是否正确")
+                    return
+
+                # 列表首位可能是「置顶旧作」, 因此按发布时间取真正最新的一条
+                candidates = [v for v in videos if v.get("pub_ts")]
+                latest = max(candidates, key=lambda v: v.get("pub_ts") or 0) if candidates else videos[0]
+
+                record = SubscriptionRecord(
+                    sub_user=sub_user, uid=mid, sub_type='video', platform='bilibili',
+                    nickname=nickname,
+                )
+                await self.listener._push_bili_video_message(sub_user, record, latest)
+
+                yield event.plain_result(
+                    f"✅ 已获取到 {nickname} 的最新投稿\n"
+                    f"📝 {str(latest.get('title') or '无标题')[:50]}\n"
+                    f"🔗 {latest.get('url') or ''}\n"
+                    f"测试消息已发送到当前会话"
+                )
+
+        except Exception as e:
+            logger.error(f"B站测试失败: {e}")
+            yield event.plain_result(f"❌ 测试失败: {str(e)}")
+
     @command("dy_clear")
     @permission_type(PermissionType.ADMIN)
     async def dy_clear(self, event: AstrMessageEvent):
@@ -552,18 +930,21 @@ class Main(Star):
         """
         删除指定会话指定用户的订阅（管理员）。
 
-        用法: /dy_global_unsub <会话UMO> <UID>
+        用法: /dy_global_unsub <会话UMO> <UID> [bilibili]
+        末尾加 bilibili 时删的是 B 站订阅(默认删抖音)。
         """
         args = raw_args.strip().split() if raw_args.strip() else []
         if len(args) < 2:
-            yield event.plain_result("❌ 用法: /dy_global_unsub <会话UMO> <UID>")
+            yield event.plain_result("❌ 用法: /dy_global_unsub <会话UMO> <UID> [bilibili]")
             return
         target_user = args[0]
-        target_uid = args[1]
+        target_uid = parse_mid(args[1]) if args[1].isdigit() else args[1]
+        platform = "bilibili" if any(a.lower() == "bilibili" for a in args[2:]) else "douyin"
         for st in ['video', 'live']:
-            self.data_manager.remove_subscription(target_user, target_uid, st)
+            self.data_manager.remove_subscription(target_user, target_uid, st, platform)
         await self._restart_listener()
-        yield event.plain_result(f"✅ 已移除 {target_user} 的 {target_uid} 订阅")
+        tag = "B站" if platform == "bilibili" else "抖音"
+        yield event.plain_result(f"✅ 已移除 {target_user} 的{tag}订阅 {target_uid}")
 
     @command("dy_bridge_restart")
     @permission_type(PermissionType.ADMIN)
@@ -573,6 +954,9 @@ class Main(Star):
         cookie = (self.cfg.get("douyin_cookie", "").strip()
                   or self.cfg.get("douyin_live_cookie", "").strip())
         self.amagi.set_cookie(cookie)
+        # B 站凭据(附属功能): 配置里的优先, 否则重新尝试借用 bilibili 插件的凭据
+        self.enable_bilibili = bool(self.cfg.get("enable_bilibili", False))
+        self.amagi.set_bilibili_cookie(self._resolve_bilibili_cookie())
         try:
             await self.amagi.prepare()
         except Exception as e:
@@ -586,7 +970,8 @@ class Main(Star):
         if ok:
             yield event.plain_result(
                 f"✅ amagi 桥接已重启 (http://{self.amagi.host}:{self.amagi.port}, "
-                f"cookie={'已配置' if self.amagi.cookie_configured else '未配置'})"
+                f"cookie={'已配置' if self.amagi.cookie_configured else '未配置'}, "
+                f"B站凭据={'已配置' if self.amagi.bilibili_cookie_configured else '未配置'})"
             )
         else:
             yield event.plain_result(
@@ -623,6 +1008,10 @@ class Main(Star):
         else:
             silent = "🟢 正常"
 
+        bili_state = "🟢 开启" if self.enable_bilibili else "🔴 关闭"
+        bili_cookie = "✅ 已配置" if self.amagi.bilibili_cookie_configured else "❌ 未配置"
+        bili_subs = self.subscription_service.get_subscription_count('bilibili')
+
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
@@ -639,6 +1028,10 @@ class Main(Star):
             f"轮询间隔: {self.cfg.get('poll_interval', 60)}秒\n"
             f"直播监控: {'🟢 开启' if self.cfg.get('enable_live_monitor', True) else '🔴 关闭'}\n"
             f"订阅总数: {total_subs} (视频 {video_subs} / 直播 {live_subs})\n"
+            f"{'=' * 20}\n"
+            f"B站监控: {bili_state} (凭据{bili_cookie}, 订阅 {bili_subs})\n"
+            f"B站投稿扫描: {listener['last_bili_video_scan']}\n"
+            f"B站直播扫描: {listener['last_bili_live_scan']}\n"
             f"{'=' * 20}\n"
             f"amagi 桥接: {bridge_state} ({bridge['port']})\n"
             f"amagi 运行时: {amagi_ready} (v{bridge['amagi_version']})\n"

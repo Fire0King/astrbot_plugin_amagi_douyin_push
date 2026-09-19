@@ -156,6 +156,7 @@ class AmagiService:
         self.amagi_entry: Optional[Path] = None   # 已定位到的 dist 入口文件
 
         self.cookie: str = ""
+        self.bilibili_cookie: str = ""
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._started: bool = False      # 是否已成功监听端口
         self._build_done: bool = False   # 本轮是否已检查/安装过 amagi
@@ -190,6 +191,14 @@ class AmagiService:
     def set_cookie(self, cookie: str):
         self.cookie = (cookie or "").strip()
 
+    @property
+    def bilibili_cookie_configured(self) -> bool:
+        return bool(self.bilibili_cookie)
+
+    def set_bilibili_cookie(self, cookie: str):
+        """B 站凭据(SESSDATA=...; bili_jct=...; buvid3=...), 作为附属功能可为空"""
+        self.bilibili_cookie = (cookie or "").strip()
+
     def status_info(self) -> Dict[str, Any]:
         return {
             "built": self._build_ok,
@@ -199,6 +208,7 @@ class AmagiService:
             "host": self.host,
             "port": self.port,
             "cookie_configured": self.cookie_configured,
+            "bilibili_cookie_configured": self.bilibili_cookie_configured,
             "node": self.node_bin,
             "npm": self.npm_bin,
             "amagi_dir": str(self.amagi_dir),
@@ -425,6 +435,7 @@ class AmagiService:
 
         env = dict(os.environ)
         env["DOUYIN_COOKIE"] = self.cookie
+        env["BILIBILI_COOKIE"] = self.bilibili_cookie
         env["AMAGI_PORT"] = str(self.port)
         env["AMAGI_DIR"] = str(self.amagi_dir)
         # 直接把定位到的入口文件传给桥接脚本, 避免 JS 侧重复猜测目录布局

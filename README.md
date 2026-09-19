@@ -2,6 +2,10 @@
 
 一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件，用于**监控抖音用户的视频更新和直播状态**，实时推送开播提醒与视频发布通知到指定会话。
 
+> 🅱️ **附属功能：B 站订阅（可选）** — 同一个插件内还可以监控 **B 站 UP 主的新投稿与开播/下播**，
+> 配置 `enable_bilibili: true` 后即可用 `/bili_sub` 订阅，卡片为本地 Pillow 自绘的 B 站风格。
+> 该功能默认关闭，**不影响抖音侧的既有行为**；B 站数据同样走 amagi 桥接，无需再装第二个插件。
+
 数据抓取基于 [amagi](https://github.com/ikenxuan/amagi)（Node.js SDK）。**无需 git 子模块、无需 pnpm、无需手动构建**：
 插件首次启动时自动用 npm 安装官方包 `@ikenxuan/amagi`（该包已内置构建产物）到插件目录下的 `.amagi/`，
 随后拉起常驻的 amagi HTTP 服务，Python 侧通过本机端口调用抖音网页版接口。
@@ -27,7 +31,10 @@
   （B 站插件约 1440px）；文字按倍率矢量重绘，放大后依然锐利；竖版封面两侧用**封面自身的模糊图**铺底
 - 📐 **尺寸自适应** — 卡片超出平台图片限制时自动改以文件（File）发送，不再被平台拒收
 - ♻️ **渲染缓存** — 同一视频被多个会话订阅时只渲染一次；发送失败自动降级重发，推送不丢
-- 🧩 **amagi 数据桥接** — 插件自动拉起常驻 Node 进程运行 amagi HTTP 服务，本地调用抖音网页版接口
+- 🅱️ **B 站订阅（附属功能，默认关闭）** — 开启 `enable_bilibili` 后，用 `/bili_sub` 订阅 B 站 UP 主：
+  新投稿（自动过滤置顶旧作）与开播/下播推送，卡片为 B 站粉色风格的**本地 Pillow 自绘**；
+  B 站凭据留空时会**自动借用 `astrbot_plugin_bilibili` 已保存的登录信息**，无需重复填写
+- 🧩 **amagi 数据桥接** — 插件自动拉起常驻 Node 进程运行 amagi HTTP 服务，本地调用抖音/B 站网页版接口
 
 ---
 
@@ -113,6 +120,8 @@ pip install -r requirements.txt
 | `font_path` | 本地卡片的中文字体路径，留空自动探测（容器内一般无需填写） |
 | `render_cache_limit` | 渲染结果缓存条数上限，默认 32 |
 | `reconnect_silent` | 重连静默：距上次成功推送超过 6 小时（断电/断网/长期失败）时，恢复后先静默一个轮询周期，避免积压更新一次性刷屏，默认关闭 |
+| `enable_bilibili` | **B 站订阅（附属功能）**：开启后可用 `/bili_sub` 订阅 UP 主投稿与开播，默认关闭 |
+| `bilibili_cookie` | B 站凭据：留空时自动借用 `astrbot_plugin_bilibili` 已保存的登录信息；也可手动填 `SESSDATA=xxx; bili_jct=xxx; buvid3=xxx` |
 
 #### 获取 Cookie
 
@@ -171,15 +180,31 @@ pip install -r requirements.txt
 /dy_info MS4wLjABAAAA...
 ```
 
+### 🅱️ B 站命令（需先开启 `enable_bilibili`）
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `/bili_sub <UID/主页URL> [选项]` | 订阅投稿**和**直播 | `/bili_sub https://space.bilibili.com/525972018` |
+| `/bili_sub video <UID/主页URL> [选项]` | 仅订阅投稿 | `/bili_sub video 525972018` |
+| `/bili_sub live <UID/主页URL> [选项]` | 仅订阅直播 | `/bili_sub live 525972018 live_atall` |
+| `/bili_unsub <UID> [video/live]` | 取消订阅 | `/bili_unsub 525972018 video` |
+| `/bili_list`（别名 `/B站订阅列表`） | 列出当前会话的 B 站订阅 | `/bili_list` |
+| `/bili_info <UID/主页URL>` | 查询 UP 主信息（昵称/粉丝数） | `/bili_info 525972018` |
+| `/bili_test [live] <UID/主页URL>` | 测试推送（不保存订阅） | `/bili_test live 525972018` |
+
+- B 站订阅同样支持上面那张表的 `at_all` / `live_atall` 选项；**下播不 @全体**，避免打扰。
+- 抖音与 B 站的订阅**互相独立**（同一 UID 也不会串台），`/dy_sub_list` 与 `/bili_list` 各看各的。
+- 首次订阅后的第一轮扫描只记录基线（不会把历史投稿一次性推完），之后才有新内容推送。
+
 ### 管理员命令
 
 | 命令 | 说明 |
 |------|------|
-| `/dy_clear` | 清空当前会话所有订阅 |
+| `/dy_clear` | 清空当前会话所有订阅（抖音 + B 站） |
 | `/dy_global_list` | 查看所有会话的订阅 |
-| `/dy_global_unsub <UMO> <UID>` | 删除指定会话指定用户的订阅 |
-| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行，会重新检查 amagi 运行时） |
-| `/dy_status` | 查看插件与桥接运行状态（含推送状态/上次推送成功时间/渲染缓存） |
+| `/dy_global_unsub <UMO> <UID> [bilibili]` | 删除指定会话指定用户的订阅（末尾加 `bilibili` 则删 B 站订阅） |
+| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行，会重新检查 amagi 运行时，并重新读取 B 站凭据） |
+| `/dy_status` | 查看插件与桥接运行状态（含推送状态/上次推送成功时间/渲染缓存/B 站监控与凭据状态） |
 
 ---
 
@@ -196,16 +221,17 @@ astrbot_plugin_amagi_douyin_push/
 │   └── server.mjs           # Node 桥接入口（启动 amagi HTTP 服务）
 ├── core/
 │   ├── douyin.py            # 抖音数据适配（profile/作品/直播快照）
-│   ├── models.py            # 数据模型
+│   ├── bilibili.py          # B 站数据适配（投稿动态/直播状态/用户名片，附属功能）
+│   ├── models.py            # 数据模型（订阅记录带 platform 字段）
 │   ├── data_manager.py      # 数据持久化
 │   └── utils.py             # 工具函数
 └── services/
-    ├── amagi_service.py     # 桥接进程管理 + HTTP 调用
-    ├── listener.py          # 后台轮询监听 + 消息链构建
+    ├── amagi_service.py     # 桥接进程管理 + HTTP 调用（抖音/B 站共用）
+    ├── listener.py          # 后台轮询监听 + 消息链构建（抖音/B 站分平台调度）
     ├── dispatcher.py        # 通知发送出口（静默模式/发送结果/成功回调）
-    ├── subscription_service.py  # 订阅管理
+    ├── subscription_service.py  # 订阅管理（按 platform 隔离）
     ├── renderer.py          # 消息渲染（引擎分派：local / html）
-    └── card_renderer.py     # Pillow 本地卡片自绘（不依赖 t2i）
+    └── card_renderer.py     # Pillow 本地卡片自绘（不依赖 t2i，含 B 站粉色卡）
 ```
 
 ---
@@ -390,6 +416,33 @@ OOM Killer 把 NapCat/AstrBot 干掉）。
 **本地渲染的取舍**：版式是代码绘制的（圆角卡片 + 圆形头像 + 封面 contain 居中 + 统计图标），
 观感与 HTML 模板接近但不完全相同；统计图标用矢量绘制而非 emoji（避免依赖 emoji 字体）。
 **成品尺寸**由 `card_scale` 控制（默认 4 → 约 1616px 宽，和 B 站插件卡片同级；`1` 就是原来的 404px）。
+
+> 💡 **素材下载的 Referer**：各平台图床对 Referer 很敏感 —— 抖音 CDN 需要抖音 Referer，
+> 而 B 站图床（`i0.hdslb.com`）拿到抖音 Referer 会**直接 403**（封面变成灰色占位、整张卡明显变小）。
+> 因此插件会**按图片域名挑 Referer**，失败再兜一次"不带 Referer"，两边都能正常取图。
+
+### Q12: B 站订阅怎么用？为什么默认是关闭的？
+
+**开启方式**：在 WebUI 配置里把 `enable_bilibili` 打开（或手动写 `"enable_bilibili": true`），重载插件，
+然后 `/bili_sub 525972018` 即可。
+
+**为什么默认关闭**：这是**附属功能**（抖音插件顺带做的 B 站支持），不开启时完全不会扫描 B 站、
+也不会占用额外的接口调用，保持抖音侧的原有行为不变。它存在的意义是"以前装的 B 站插件万一哪天用不了，
+这边还能顶上"，所以做成了开关而不是默认行为。
+
+**凭据从哪来**：B 站接口对未登录请求很吝啬（拿不到完整投稿列表、直播间状态也可能拿不到），所以需要凭据：
+
+1. 插件会**自动借用** `astrbot_plugin_bilibili` 已保存的登录信息
+   （`data/plugin_data/astrbot_plugin_bilibili/astrbot_plugin_bilibili.json`
+   或 `data/config/astrbot_plugin_bilibili_config.json`），你什么都不用填；
+2. 想自己填就在 `bilibili_cookie` 里粘贴 `SESSDATA=xxx; bili_jct=xxx; buvid3=xxx`（整段 Cookie 也行）。
+
+`/dy_status` 会显示 `B站监控: 已开启 (凭据已配置, 订阅 N)`，凭据没配上会明确提示。
+改了凭据后执行 `/dy_bridge_restart` 让它重新读取。
+
+**支持的范围**：**投稿视频**（`DYNAMIC_TYPE_AV` 动态，自动跳过置顶旧作）与**开播/下播**。
+图文/转发/专栏动态暂不推送；开播状态以 `liveStatus` 为准，接口给不出确定状态时**按"未知"处理**，
+不会误判成下播。
 
 ---
 

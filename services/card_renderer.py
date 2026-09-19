@@ -18,6 +18,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from astrbot.api import logger
 from astrbot.api.star import StarTools
@@ -35,11 +36,13 @@ TEXT_BODY = (0x33, 0x33, 0x33)
 TEXT_WEAK = (0x88, 0x88, 0x88)
 TEXT_FAINT = (0xAA, 0xAA, 0xAA)
 ACCENT = (0xFE, 0x2C, 0x55)            # 抖音红
+BILI_ACCENT = (0xFB, 0x72, 0x99)       # B 站粉
 OFFLINE_GRAY = (0x99, 0x99, 0x99)
 COVER_BG = (0xF0, 0xF0, 0xF0)
 AVATAR_BG = (0xE6, 0xE6, 0xEA)
 
-COVER_BOX_H = 420                      # 封面展示区高度(contain 适配)
+COVER_BOX_H = 420                      # 抖音竖版封面展示区高度(contain 适配)
+BILI_COVER_H = 214                     # B 站横版封面(16:9 → 380x214, 正好铺满)
 
 # ==================== 输出倍率 ====================
 # 版式按"设计单位"排版(卡片宽 380, 与 assets/templates/*.html 一致), 绘制时整体乘以该倍率。
@@ -235,6 +238,15 @@ def _draw_dot(d: ImageDraw.ImageDraw, x: float, y: float, size: int, color):
     d.ellipse((x, y, x + size, y + size), fill=color)
 
 
+def _draw_clock(d: ImageDraw.ImageDraw, x: float, y: float, size: int, color):
+    """时长用的表盘图标"""
+    w = max(1, int(size * 0.13))
+    d.ellipse((x, y, x + size, y + size), outline=color, width=w)
+    cx, cy = x + size / 2, y + size / 2
+    d.line((cx, cy, cx, y + size * 0.22), fill=color, width=w)
+    d.line((cx, cy, x + size * 0.76, cy), fill=color, width=w)
+
+
 class CardRenderer:
     """用 Pillow 画视频/直播卡片"""
 
@@ -282,35 +294,71 @@ class CardRenderer:
 
     # ---------------- 图片下载 ----------------
 
+    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36")
+
     @staticmethod
-    def _load_image(url: str) -> Optional[Image.Image]:
+    def _image_headers(url: str) -> List[Dict[str, str]]:
+        """
+        按图片域名给出 Referer 尝试顺序 (逐个试, 前一个失败就用下一个)。
+
+        实测坑: B 站图床 (i0.hdslb.com) 拿到抖音 Referer 会**直接 403**,
+        卡片于是只剩灰色占位(整张卡明显变小变空)。所以必须按平台挑 Referer,
+        最后再兜一次「不带 Referer」(多数图床此时反而放行)。
+        """
+        host = (urlparse(url).netloc or "").lower()
+        if "hdslb" in host or "bilibili" in host:
+            referers = ["https://www.bilibili.com/", ""]
+        elif "douyin" in host or "byteimg" in host or "bytedance" in host:
+            referers = ["https://www.douyin.com/", ""]
+        else:
+            referers = ["", "https://www.douyin.com/"]
+        headers: List[Dict[str, str]] = []
+        for ref in referers:
+            item = {"User-Agent": CardRenderer._UA}
+            if ref:
+                item["Referer"] = ref
+            headers.append(item)
+        return headers
+
+    @classmethod
+    def _load_image(cls, url: str) -> Optional[Image.Image]:
         """下载图片; 支持 http(s)、file:// 与本地路径(便于离线测试)"""
         url = (url or "").strip()
         if not url:
             return None
-        try:
-            if url.startswith("file://"):
+        if url.startswith("file://"):
+            try:
                 with open(url[7:], "rb") as f:
                     return Image.open(io.BytesIO(f.read()))
-            if not url.lower().startswith(("http://", "https://")):
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"卡片素材读取失败({url[:60]}): {e}")
+                return None
+        if not url.lower().startswith(("http://", "https://")):
+            try:
                 if Path(url).exists():
                     with open(url, "rb") as f:
                         return Image.open(io.BytesIO(f.read()))
-                return None
-            import requests
-            resp = requests.get(
-                url, timeout=10,
-                headers={
-                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"),
-                    "Referer": "https://www.douyin.com/",
-                },
-            )
-            resp.raise_for_status()
-            return Image.open(io.BytesIO(resp.content))
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"卡片素材下载失败({url[:60]}): {e}")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"卡片素材读取失败({url[:60]}): {e}")
             return None
+
+        try:
+            import requests
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"卡片素材下载不可用(缺少 requests): {e}")
+            return None
+
+        last_err: Optional[Exception] = None
+        for headers in cls._image_headers(url):
+            try:
+                resp = requests.get(url, timeout=10, headers=headers)
+                resp.raise_for_status()
+                return Image.open(io.BytesIO(resp.content))
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+        logger.debug(f"卡片素材下载失败({url[:60]}): {last_err}")
+        return None
 
     # ---------------- 输出 ----------------
 
@@ -517,6 +565,209 @@ class CardRenderer:
 
         return self._save(canvas, "l")
 
+    # ---------------- B 站视频卡片 ----------------
+
+    def render_bili_video_card(self, data: dict) -> Optional[str]:
+        """
+        B 站投稿视频卡片。
+
+        与抖音卡片的差别: B 站封面是 16:9 横版, 正好铺满卡宽(无留白);
+        统计项为 播放/弹幕, 并在封面右下角压一个时长胶囊。
+        """
+        u = self._u
+        nickname = str(data.get("nickname") or "B站UP主")
+        title = str(data.get("title") or "无标题")
+        desc = str(data.get("desc") or "")
+        url = str(data.get("url") or "")
+        play = str(data.get("play") or "0")
+        danmaku = str(data.get("danmaku") or "0")
+        duration = str(data.get("duration") or "")
+
+        f_nick = self.font(u(16), bold=True)
+        f_tag = self.font(u(12), bold=True)
+        f_title = self.font(u(15))
+        f_stat = self.font(u(12))
+        f_url = self.font(u(11))
+        f_avatar = self.font(u(18), bold=True)
+        f_dur = self.font(u(12), bold=True)
+
+        avatar = self._load_image(str(data.get("avatar") or ""))
+        cover = self._load_image(str(data.get("cover") or ""))
+
+        card_w = u(CARD_WIDTH)
+        inner_w = card_w - u(32)
+        pad = u(PAGE_PAD)
+
+        probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        title_lines = _wrap_text(probe, title, f_title, inner_w, max_lines=2)
+        desc_lines = _wrap_text(probe, desc, f_stat, inner_w, max_lines=1) if desc else []
+        line_h = u(21)
+        url_lines = _wrap_text(probe, url, f_url, inner_w, max_lines=1)
+
+        header_h = u(68)
+        cover_img = None
+        cover_h = 0
+        if cover is not None:
+            cover_img = _fit_contain(cover.convert("RGB"), card_w, u(BILI_COVER_H))
+            cover_h = cover_img.height
+        body_h = (u(12) + len(title_lines) * line_h
+                  + (u(6) + u(18) if desc_lines else 0)
+                  + u(10) + u(20) + (u(8) + u(16) if url_lines else 0) + u(14))
+        card_h = header_h + cover_h + body_h
+
+        canvas = Image.new("RGB", (card_w + pad * 2, card_h + pad * 2), BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+        card_x, card_y = pad, pad
+        draw.rounded_rectangle((card_x, card_y, card_x + card_w, card_y + card_h),
+                               radius=u(CARD_RADIUS), fill=CARD_COLOR)
+
+        # 头部
+        avatar_size = u(40)
+        avatar_img = _circle_avatar(avatar, avatar_size, nickname, f_avatar)
+        avatar_xy = (card_x + u(16), card_y + u(14))
+        canvas.paste(avatar_img, avatar_xy, avatar_img)
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((avatar_xy[0], avatar_xy[1],
+                      avatar_xy[0] + avatar_size, avatar_xy[1] + avatar_size),
+                     outline=BILI_ACCENT, width=max(2, u(2)))
+        draw.text((card_x + u(66), card_y + u(18)),
+                  _ellipsize(probe, nickname, f_nick, inner_w - u(60)),
+                  font=f_nick, fill=TEXT_MAIN)
+        _draw_play(draw, card_x + u(66), card_y + u(42), u(9), BILI_ACCENT)
+        draw.text((card_x + u(80), card_y + u(39)), "新视频", font=f_tag, fill=BILI_ACCENT)
+
+        y = card_y + header_h
+
+        # 封面(16:9 横版, 正好铺满; 非 16:9 时用封面模糊图铺底)
+        if cover_img is not None:
+            if cover_img.width < card_w:
+                backdrop = _fit_cover(cover.convert("RGB"), card_w, cover_h)
+                canvas.paste(backdrop.filter(ImageFilter.GaussianBlur(u(18))), (card_x, y))
+            canvas.paste(cover_img, (card_x + (card_w - cover_img.width) // 2, y))
+            draw = ImageDraw.Draw(canvas)
+            if duration:
+                # 右下角时长胶囊
+                tw = int(draw.textlength(duration, font=f_dur))
+                pill_w, pill_h = tw + u(14), u(20)
+                px, py = card_x + card_w - pill_w - u(8), y + cover_h - pill_h - u(8)
+                draw.rounded_rectangle((px, py, px + pill_w, py + pill_h),
+                                       radius=u(4), fill=(0x20, 0x20, 0x20))
+                draw.text((px + u(7), py + u(2)), duration, font=f_dur, fill=(0xFF, 0xFF, 0xFF))
+            y += cover_h
+
+        # 正文
+        y += u(12)
+        for line in title_lines:
+            draw.text((card_x + u(16), y), line, font=f_title, fill=TEXT_BODY)
+            y += line_h
+        if desc_lines:
+            y += u(6)
+            draw.text((card_x + u(16), y), desc_lines[0], font=f_stat, fill=TEXT_WEAK)
+            y += u(18)
+        y += u(10)
+
+        x = card_x + u(16)
+        for icon_fn, value in ((_draw_play, play), (_draw_comment, danmaku)):
+            icon_fn(draw, x, y + u(2), u(13), TEXT_WEAK)
+            x += u(17)
+            draw.text((x, y), value, font=f_stat, fill=(0x55, 0x55, 0x55))
+            x += int(draw.textlength(value, font=f_stat)) + u(14)
+        if duration:
+            _draw_clock(draw, x, y + u(2), u(13), TEXT_WEAK)
+            x += u(17)
+            draw.text((x, y), duration, font=f_stat, fill=(0x55, 0x55, 0x55))
+
+        if url_lines:
+            y += u(20) + u(8)
+            draw.text((card_x + u(16), y), url_lines[0], font=f_url, fill=TEXT_FAINT)
+
+        return self._save(canvas, "bv")
+
+    # ---------------- B 站直播卡片 ----------------
+
+    def render_bili_live_card(self, data: dict) -> Optional[str]:
+        u = self._u
+        nickname = str(data.get("nickname") or "B站UP主")
+        title = str(data.get("title") or "无标题")
+        url = str(data.get("url") or "")
+        is_live = bool(data.get("is_live"))
+        badge_text = "直播中" if is_live else "已下播"
+        badge_color = BILI_ACCENT if is_live else OFFLINE_GRAY
+
+        f_badge = self.font(u(12), bold=True)
+        f_nick = self.font(u(16), bold=True)
+        f_title = self.font(u(15))
+        f_url = self.font(u(11))
+        f_avatar = self.font(u(22), bold=True)
+
+        avatar = self._load_image(str(data.get("avatar") or ""))
+        cover = self._load_image(str(data.get("cover") or ""))
+
+        card_w = u(CARD_WIDTH)
+        inner_w = card_w - u(32)
+        pad = u(PAGE_PAD)
+
+        probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        title_lines = _wrap_text(probe, title, f_title, inner_w, max_lines=2)
+        url_lines = _wrap_text(probe, url, f_url, inner_w, max_lines=1)
+
+        header_h = u(84)
+        cover_img = None
+        cover_h = 0
+        if cover is not None:
+            cover_img = _fit_contain(cover.convert("RGB"), card_w, u(BILI_COVER_H))
+            cover_h = cover_img.height
+        line_h = u(21)
+        body_h = (u(12) + len(title_lines) * line_h
+                  + (u(8) + u(16) if url_lines else 0) + u(14))
+        card_h = header_h + cover_h + body_h
+
+        canvas = Image.new("RGB", (card_w + pad * 2, card_h + pad * 2), BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+        card_x, card_y = pad, pad
+        draw.rounded_rectangle((card_x, card_y, card_x + card_w, card_y + card_h),
+                               radius=u(CARD_RADIUS), fill=CARD_COLOR)
+
+        avatar_size = u(56)
+        avatar_img = _circle_avatar(avatar, avatar_size, nickname, f_avatar)
+        avatar_xy = (card_x + u(16), card_y + u(14))
+        canvas.paste(avatar_img, avatar_xy, avatar_img)
+        draw = ImageDraw.Draw(canvas)
+        draw.ellipse((avatar_xy[0], avatar_xy[1],
+                      avatar_xy[0] + avatar_size, avatar_xy[1] + avatar_size),
+                     outline=badge_color, width=max(2, u(2)))
+        draw.text((card_x + u(84), card_y + u(16)),
+                  _ellipsize(probe, nickname, f_nick, inner_w - u(80)),
+                  font=f_nick, fill=TEXT_MAIN)
+
+        dot_y = card_y + u(49)
+        if is_live:
+            _draw_dot(draw, card_x + u(88), dot_y, u(8), badge_color)
+        else:
+            draw.ellipse((card_x + u(88), dot_y, card_x + u(96), dot_y + u(8)),
+                         outline=badge_color, width=max(2, u(2)))
+        draw.text((card_x + u(102), card_y + u(46)), badge_text,
+                  font=f_badge, fill=badge_color)
+
+        y = card_y + header_h
+        if cover_img is not None:
+            if cover_img.width < card_w:
+                backdrop = _fit_cover(cover.convert("RGB"), card_w, cover_h)
+                canvas.paste(backdrop.filter(ImageFilter.GaussianBlur(u(18))), (card_x, y))
+            canvas.paste(cover_img, (card_x + (card_w - cover_img.width) // 2, y))
+            draw = ImageDraw.Draw(canvas)
+            y += cover_h
+
+        y += u(12)
+        for line in title_lines:
+            draw.text((card_x + u(16), y), line, font=f_title, fill=TEXT_BODY)
+            y += line_h
+        if url_lines:
+            y += u(8)
+            draw.text((card_x + u(16), y), url_lines[0], font=f_url, fill=TEXT_FAINT)
+
+        return self._save(canvas, "bl")
+
     # ---------------- 线程池入口 ----------------
 
     async def arender_video_card(self, data: dict) -> Optional[str]:
@@ -525,6 +776,12 @@ class CardRenderer:
 
     async def arender_live_card(self, data: dict) -> Optional[str]:
         return await asyncio.to_thread(self.render_live_card, data)
+
+    async def arender_bili_video_card(self, data: dict) -> Optional[str]:
+        return await asyncio.to_thread(self.render_bili_video_card, data)
+
+    async def arender_bili_live_card(self, data: dict) -> Optional[str]:
+        return await asyncio.to_thread(self.render_bili_live_card, data)
 
 
 def _ellipsize(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,

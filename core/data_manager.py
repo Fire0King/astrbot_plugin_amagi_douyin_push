@@ -49,46 +49,59 @@ class DataManager:
         except Exception as e:
             logger.error(f"保存订阅数据失败: {e}")
 
-    def get_subscriptions(self, sub_user: str) -> List[SubscriptionRecord]:
-        """获取某个会话的所有订阅"""
-        return self._subscriptions.get(sub_user, [])
+    def get_subscriptions(self, sub_user: str,
+                          platform: Optional[str] = None) -> List[SubscriptionRecord]:
+        """获取某个会话的所有订阅 (可按平台过滤)"""
+        records = self._subscriptions.get(sub_user, [])
+        if platform:
+            return [r for r in records if (r.platform or "douyin") == platform]
+        return records
 
     def get_all_subscriptions(self) -> Dict[str, List[SubscriptionRecord]]:
         """获取所有会话的订阅"""
         return self._subscriptions
 
+    @staticmethod
+    def _same(record: SubscriptionRecord, uid: str, sub_type: str, platform: str) -> bool:
+        """同一条订阅的判定: 平台 + 用户 + 类型 (老数据缺 platform 时按抖音处理)"""
+        return ((record.platform or "douyin") == platform
+                and record.uid == uid and record.sub_type == sub_type)
+
     def add_subscription(self, sub_user: str, record: SubscriptionRecord) -> bool:
         """添加订阅"""
         if sub_user not in self._subscriptions:
             self._subscriptions[sub_user] = []
-        # 检查是否已存在
+        # 检查是否已存在 (同一平台同一用户同一类型)
+        platform = record.platform or "douyin"
         for r in self._subscriptions[sub_user]:
-            if r.uid == record.uid and r.sub_type == record.sub_type:
+            if self._same(r, record.uid, record.sub_type, platform):
                 return False
         self._subscriptions[sub_user].append(record)
         self._save()
         return True
 
-    def remove_subscription(self, sub_user: str, uid: str, sub_type: str) -> bool:
+    def remove_subscription(self, sub_user: str, uid: str, sub_type: str,
+                            platform: str = "douyin") -> bool:
         """移除订阅"""
         if sub_user not in self._subscriptions:
             return False
         original_len = len(self._subscriptions[sub_user])
         self._subscriptions[sub_user] = [
             r for r in self._subscriptions[sub_user]
-            if not (r.uid == uid and r.sub_type == sub_type)
+            if not self._same(r, uid, sub_type, platform)
         ]
         if len(self._subscriptions[sub_user]) != original_len:
             self._save()
             return True
         return False
 
-    def update_subscription(self, sub_user: str, uid: str, sub_type: str, **kwargs):
+    def update_subscription(self, sub_user: str, uid: str, sub_type: str,
+                            platform: str = "douyin", **kwargs):
         """更新订阅信息"""
         if sub_user not in self._subscriptions:
             return False
         for r in self._subscriptions[sub_user]:
-            if r.uid == uid and r.sub_type == sub_type:
+            if self._same(r, uid, sub_type, platform):
                 for key, value in kwargs.items():
                     if hasattr(r, key):
                         setattr(r, key, value)
@@ -96,12 +109,13 @@ class DataManager:
                 return True
         return False
 
-    def get_subscription(self, sub_user: str, uid: str, sub_type: str) -> Optional[SubscriptionRecord]:
+    def get_subscription(self, sub_user: str, uid: str, sub_type: str,
+                         platform: str = "douyin") -> Optional[SubscriptionRecord]:
         """获取单个订阅"""
         if sub_user not in self._subscriptions:
             return None
         for r in self._subscriptions[sub_user]:
-            if r.uid == uid and r.sub_type == sub_type:
+            if self._same(r, uid, sub_type, platform):
                 return r
         return None
 

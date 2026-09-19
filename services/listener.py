@@ -8,6 +8,11 @@ from astrbot.api import logger
 from astrbot.api.message_components import AtAll, File, Image, Plain
 from astrbot.core.star import Context
 
+from ..core.bilibili import (
+    get_live_snapshot as get_bili_live_snapshot,
+    get_user_card as get_bili_user_card,
+    get_user_videos as get_bili_user_videos,
+)
 from ..core.data_manager import DataManager
 from ..core.douyin import (
     get_aweme_id,
@@ -39,6 +44,11 @@ _MIN_AT_ALL_REMAINING = 1
 _GROUP_MESSAGE_TYPE = "GroupMessage"
 
 
+def _is_platform(record, platform: str) -> bool:
+    """订阅记录是否属于指定平台 (老数据没有 platform 字段时视为抖音)"""
+    return (getattr(record, "platform", None) or "douyin") == platform
+
+
 class DouyinListener:
     """抖音后台监听服务 (数据来源: amagi 桥接)"""
 
@@ -60,6 +70,8 @@ class DouyinListener:
 
         self.interval_secs = max(10, int(cfg.get("poll_interval", 60)))
         self.enable_live = cfg.get("enable_live_monitor", True)
+        # B 站为附属功能: 默认关闭, 开启后才轮询 B 站订阅
+        self.enable_bilibili = bool(cfg.get("enable_bilibili", False))
 
         # 渲染结果缓存: content_id -> (文本, 图片路径)
         self._render_cache: "OrderedDict[str, Tuple[str, Optional[str]]]" = OrderedDict()
@@ -70,10 +82,14 @@ class DouyinListener:
         self._running = False
         self._video_task: Optional[asyncio.Task] = None
         self._live_task: Optional[asyncio.Task] = None
+        self._bili_video_task: Optional[asyncio.Task] = None
+        self._bili_live_task: Optional[asyncio.Task] = None
 
         # 运行状态 (供 /dy_status 诊断)
         self.last_video_scan_at: float = 0.0
         self.last_live_scan_at: float = 0.0
+        self.last_bili_video_scan_at: float = 0.0
+        self.last_bili_live_scan_at: float = 0.0
         self.last_error: str = ""
         self._last_not_ready_log_at: float = 0.0
 
@@ -92,8 +108,9 @@ class DouyinListener:
 
         self._running = True
         logger.info(
-            f"抖音监听服务已启动 (间隔 {self.interval_secs}s, "
-            f"直播监控 {'开启' if self.enable_live else '关闭'})"
+            f"监听服务已启动 (间隔 {self.interval_secs}s, "
+            f"直播监控 {'开启' if self.enable_live else '关闭'}, "
+            f"B站监控 {'开启' if self.enable_bilibili else '关闭'})"
         )
 
         self._video_task = asyncio.create_task(self._video_loop())
@@ -101,6 +118,12 @@ class DouyinListener:
         if self.enable_live:
             self._live_task = asyncio.create_task(self._live_loop())
             tasks.append(self._live_task)
+        if self.enable_bilibili:
+            self._bili_video_task = asyncio.create_task(self._bili_video_loop())
+            tasks.append(self._bili_video_task)
+            if self.enable_live:
+                self._bili_live_task = asyncio.create_task(self._bili_live_loop())
+                tasks.append(self._bili_live_task)
 
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -110,7 +133,8 @@ class DouyinListener:
     async def stop(self):
         """停止后台监听 (等待任务真正结束, 避免与重启竞态)"""
         self._running = False
-        for task in (self._video_task, self._live_task):
+        for task in (self._video_task, self._live_task,
+                     self._bili_video_task, self._bili_live_task):
             if task is None or task.done():
                 continue
             task.cancel()
@@ -122,7 +146,9 @@ class DouyinListener:
                 logger.debug(f"监听任务结束异常: {e}")
         self._video_task = None
         self._live_task = None
-        logger.info("抖音监听服务已停止")
+        self._bili_video_task = None
+        self._bili_live_task = None
+        logger.info("监听服务已停止")
 
     async def restart(self):
         """重启监听: 先确认旧任务完全结束, 再启动新任务"""
@@ -146,8 +172,11 @@ class DouyinListener:
             "running": self.running,
             "interval": self.interval_secs,
             "enable_live": bool(self.enable_live),
+            "enable_bilibili": bool(self.enable_bilibili),
             "last_video_scan": _ago(self.last_video_scan_at),
             "last_live_scan": _ago(self.last_live_scan_at),
+            "last_bili_video_scan": _ago(self.last_bili_video_scan_at),
+            "last_bili_live_scan": _ago(self.last_bili_live_scan_at),
             "last_error": self.last_error,
         }
 
@@ -178,7 +207,7 @@ class DouyinListener:
                 all_subs = self.data_manager.get_all_subscriptions()
                 for sub_user, records in all_subs.items():
                     for record in records:
-                        if record.sub_type == 'video':
+                        if record.sub_type == 'video' and _is_platform(record, 'douyin'):
                             await self._check_user_videos(sub_user, record)
                 self.last_video_scan_at = time.time()
                 await asyncio.sleep(self.interval_secs)
@@ -563,7 +592,7 @@ class DouyinListener:
                 all_subs = self.data_manager.get_all_subscriptions()
                 for sub_user, records in all_subs.items():
                     for record in records:
-                        if record.sub_type == 'live':
+                        if record.sub_type == 'live' and _is_platform(record, 'douyin'):
                             await self._check_live_status(sub_user, record)
                 self.last_live_scan_at = time.time()
                 await asyncio.sleep(self.interval_secs)
@@ -700,4 +729,306 @@ class DouyinListener:
             logger.info(f"已向 {sub_user} 推送直播状态: {'开播' if is_live else '下播'}")
         except Exception as e:
             self.last_error = f"推送直播消息失败: {e}"
+            logger.error(self.last_error)
+
+    # ==================== B 站监控 (附属功能) ====================
+    #
+    # 与抖音部分完全对称: 同一套 dispatcher / 渲染缓存 / 尺寸自适应 / @全体校验,
+    # 只是数据来源换成 core.bilibili (amagi 的 /api/bilibili/* 接口)。
+    # 由 enable_bilibili 控制是否轮询; 未开启时下面这些循环根本不会启动。
+
+    async def _bili_video_loop(self):
+        """B 站投稿监控循环"""
+        while self._running:
+            try:
+                all_subs = self.data_manager.get_all_subscriptions()
+                for sub_user, records in all_subs.items():
+                    for record in records:
+                        if record.sub_type == 'video' and _is_platform(record, 'bilibili'):
+                            await self._check_bili_videos(sub_user, record)
+                self.last_bili_video_scan_at = time.time()
+                await asyncio.sleep(self.interval_secs)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                self.last_error = f"B站投稿监控循环出错: {e}"
+                logger.error(self.last_error)
+                await asyncio.sleep(10)
+
+    async def _bili_live_loop(self):
+        """B 站直播监控循环"""
+        while self._running:
+            try:
+                all_subs = self.data_manager.get_all_subscriptions()
+                for sub_user, records in all_subs.items():
+                    for record in records:
+                        if record.sub_type == 'live' and _is_platform(record, 'bilibili'):
+                            await self._check_bili_live_status(sub_user, record)
+                self.last_bili_live_scan_at = time.time()
+                await asyncio.sleep(self.interval_secs)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                self.last_error = f"B站直播监控循环出错: {e}"
+                logger.error(self.last_error)
+                await asyncio.sleep(10)
+
+    async def _check_bili_videos(self, sub_user: str, record: SubscriptionRecord):
+        """
+        检查 B 站 UP 主的新投稿。
+
+        判新旧的方式与抖音一致(不依赖列表顺序):
+          - 首次观测只写基线, 不推送;
+          - 之后以「动态 id 未见过 且 pub_ts >= 基线时间」判定新投稿;
+          - 置顶动态不特殊跳过 —— 置顶的旧作天然不满足 pub_ts 条件, 置顶的新作仍会推送。
+        """
+        mid = record.uid
+        if not mid:
+            return
+
+        try:
+            await self.amagi.ensure_started()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ensure_started 异常: {e}")
+        if not self._amagi_ready():
+            self._log_not_ready()
+            return
+
+        try:
+            videos = await get_bili_user_videos(self.amagi, mid)
+            if videos is None:
+                logger.debug(f"B站 UP {mid} 动态列表获取失败, 跳过本轮")
+                return
+
+            known_ids = {str(record.last_video_id)} | set(record.recent_ids or [])
+            known_ids.discard("None")
+            baseline_time = int(record.last_video_time or 0)
+
+            # 首次观测: 只记基线(避免把历史投稿当成新投稿刷屏)
+            if not record.last_video_id and not baseline_time:
+                if not videos:
+                    logger.debug(f"B站 UP {mid} 暂无投稿, 跳过基线")
+                    return
+                newest = max(videos, key=lambda v: v.get("pub_ts") or 0)
+                self._save_bili_baseline(sub_user, record, videos, newest)
+                logger.info(
+                    f"首次记录B站 UP {mid} 的最新投稿: {newest['bvid']} {newest['title'][:20]} "
+                    f"(仅记录基线, 不推送; 之后的新投稿才会推送)"
+                )
+                return
+
+            new_items = [
+                v for v in videos
+                if v["dynamic_id"] not in known_ids
+                and (not baseline_time or (v.get("pub_ts") or 0) >= baseline_time)
+            ]
+            if not new_items:
+                return
+
+            new_items.sort(key=lambda v: v.get("pub_ts") or 0)   # 旧 → 新依次推送
+            newest = new_items[-1]
+            updated_recent = list(dict.fromkeys(
+                [v["dynamic_id"] for v in new_items[::-1]]
+                + [str(record.last_video_id)] + (record.recent_ids or [])
+            ))[:8]
+            self.data_manager.update_subscription(
+                sub_user, mid, 'video', 'bilibili',
+                last_video_id=newest["dynamic_id"],
+                last_video_time=max(newest.get("pub_ts") or 0, baseline_time),
+                recent_ids=updated_recent,
+                nickname=newest["author"]["name"] or record.nickname,
+            )
+            logger.info(f"检测到B站 UP {mid} 更新 {len(new_items)} 个投稿: "
+                        f"{[v['bvid'] for v in new_items]}")
+
+            for video in new_items:
+                await self._push_bili_video_message(sub_user, record, video)
+
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"检查B站投稿失败 (mid={mid}): {e}"
+            logger.error(self.last_error)
+
+    def _save_bili_baseline(self, sub_user: str, record: SubscriptionRecord,
+                            videos: list, latest: dict):
+        """写入 B 站投稿基线 (last_video_id / last_video_time / recent_ids / nickname)"""
+        recent = [v["dynamic_id"] for v in sorted(
+            videos, key=lambda v: v.get("pub_ts") or 0, reverse=True)[:8]] or [latest["dynamic_id"]]
+        self.data_manager.update_subscription(
+            sub_user, record.uid, 'video', 'bilibili',
+            last_video_id=latest["dynamic_id"],
+            last_video_time=latest.get("pub_ts") or 0,
+            recent_ids=recent,
+            nickname=latest["author"]["name"] or record.nickname,
+        )
+
+    async def _push_bili_video_message(self, sub_user: str, record: SubscriptionRecord,
+                                       video: dict):
+        """推送 B 站投稿消息"""
+        try:
+            url = video.get("url") or ""
+            cover = video.get("cover") or ""
+            content_id = f"bili:{video.get('dynamic_id') or video.get('bvid')}"
+
+            cached = self._get_cached_render(content_id)
+            if cached:
+                text, img_path = cached
+            else:
+                text, img_path = await self.renderer.render_bili_video(video)
+                self._cache_render(content_id, text, img_path)
+
+            at_all = await self._check_atall_permission(sub_user, bool(record.at_all))
+
+            if img_path:
+                result = await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_image_chain(
+                        img_path, sub_user, at_all, url,
+                        f"bili_video_{video.get('bvid') or 'x'}",
+                    ),
+                    category="video",
+                    content_id=content_id,
+                ))
+                if not result.sent and not result.dropped:
+                    logger.warning(f"B站视频图片推送失败, 降级重发: {result.reason}")
+                    await self.dispatcher.publish(SubscriptionNotification(
+                        sub_user=sub_user,
+                        chain_parts=self._build_text_chain(at_all, text, cover),
+                        category="video",
+                        content_id=content_id,
+                    ))
+            else:
+                await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_text_chain(at_all, text, cover),
+                    category="video",
+                    content_id=content_id,
+                ))
+
+            logger.info(f"已向 {sub_user} 推送B站投稿: {video.get('bvid')}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"推送B站投稿消息失败: {e}")
+
+    async def _check_bili_live_status(self, sub_user: str, record: SubscriptionRecord):
+        """检查 B 站 UP 主的开播/下播"""
+        mid = record.uid
+        if not mid:
+            return
+
+        try:
+            await self.amagi.ensure_started()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"ensure_started 异常: {e}")
+        if not self._amagi_ready():
+            self._log_not_ready()
+            return
+
+        try:
+            snap = await get_bili_live_snapshot(self.amagi, mid)
+            if not snap:
+                return
+            # 状态字段缺失 → 未知, 跳过本轮(不能当作未开播, 否则会误报下播)
+            if not snap.get("status_known", False):
+                logger.debug(f"B站直播状态未知, 跳过本轮 (mid={mid})")
+                return
+
+            is_now_live = bool(snap["is_live"])
+            room_title = str(snap.get("room_title") or "")
+
+            # 首次观测只建立基线
+            if not record.live_checked:
+                self.data_manager.update_subscription(
+                    sub_user, mid, 'live', 'bilibili',
+                    live_checked=True,
+                    is_live=is_now_live,
+                    last_live_title=room_title or record.last_live_title,
+                    room_id=str(snap.get("room_id") or record.room_id or ""),
+                    nickname=record.nickname,
+                )
+                logger.info(
+                    f"首次记录B站 UP {mid} 的直播状态: "
+                    f"{'直播中' if is_now_live else '未开播'} "
+                    f"(仅记录基线, 不推送; 之后的状态变化才会推送)"
+                )
+                return
+
+            if is_now_live and not record.is_live:
+                self.data_manager.update_subscription(
+                    sub_user, mid, 'live', 'bilibili',
+                    is_live=True,
+                    last_live_title=room_title,
+                    room_id=str(snap.get("room_id") or record.room_id or ""),
+                )
+                logger.info(f"检测到B站 UP {mid} 开播: {room_title or '无标题'}")
+                await self._push_bili_live_message(sub_user, record, True, room_title,
+                                                   cover=snap.get("cover", ""))
+            elif (not is_now_live) and record.is_live:
+                self.data_manager.update_subscription(
+                    sub_user, mid, 'live', 'bilibili',
+                    is_live=False,
+                )
+                logger.info(f"检测到B站 UP {mid} 下播")
+                await self._push_bili_live_message(sub_user, record, False,
+                                                   record.last_live_title,
+                                                   cover=snap.get("cover", ""))
+
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"检查B站直播状态失败 (mid={mid}): {e}"
+            logger.error(self.last_error)
+
+    async def _push_bili_live_message(self, sub_user: str, record: SubscriptionRecord,
+                                      is_live: bool, title: str = "", cover: str = ""):
+        """推送 B 站开播/下播消息"""
+        try:
+            # 头像/昵称从用户名片取(直播状态接口不带这些字段); 失败则留空, 卡片会退化成灰色占位
+            avatar = ""
+            try:
+                card = await get_bili_user_card(self.amagi, record.uid)
+                if card:
+                    avatar = str(card.get("face") or "")
+                    name = str(card.get("name") or "")
+                    if name and name != record.nickname:
+                        self.data_manager.update_subscription(
+                            sub_user, record.uid, 'live', 'bilibili', nickname=name)
+                        record.nickname = name
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"获取B站用户名片失败: {e}")
+
+            text, img_path = await self.renderer.render_bili_live(
+                record, is_live, title, cover=cover, avatar=avatar,
+            )
+            url = (f"https://live.bilibili.com/{record.room_id}" if record.room_id
+                   else f"https://space.bilibili.com/{record.uid}")
+            # 只有开播才 @全体 (下播不打扰), 且要先确认机器人真有权限
+            at_all = await self._check_atall_permission(
+                sub_user, bool(is_live and (record.live_atall or record.at_all))
+            )
+
+            if img_path:
+                result = await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_image_chain(
+                        img_path, sub_user, at_all, url, f"bili_live_{record.uid}",
+                    ),
+                    category="live",
+                    content_id=str(record.uid),
+                ))
+                if not result.sent and not result.dropped:
+                    logger.warning(f"B站直播图片推送失败, 降级重发: {result.reason}")
+                    await self.dispatcher.publish(SubscriptionNotification(
+                        sub_user=sub_user,
+                        chain_parts=self._build_text_chain(at_all, text, cover or avatar),
+                        category="live",
+                        content_id=str(record.uid),
+                    ))
+            else:
+                await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_text_chain(at_all, text, cover or avatar),
+                    category="live",
+                    content_id=str(record.uid),
+                ))
+
+            logger.info(f"已向 {sub_user} 推送B站直播状态: {'开播' if is_live else '下播'}")
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"推送B站直播消息失败: {e}"
             logger.error(self.last_error)

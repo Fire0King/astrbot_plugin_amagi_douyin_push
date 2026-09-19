@@ -6,10 +6,11 @@ from typing import Dict, List, Optional
 class SubscriptionRecord:
     """订阅记录"""
     sub_user: str                       # 会话标识（如 group_123456）
-    uid: str                            # 抖音 sec_uid
+    uid: str                            # 抖音 sec_uid / B 站 mid
     sub_type: str                       # 'video' 或 'live'
+    platform: str = "douyin"            # 'douyin' 或 'bilibili'（老数据无此字段 → 默认抖音）
     # 订阅时的标识信息
-    sec_uid: str = ""                   # 用户的 sec_uid（视频与直播监控共用）
+    sec_uid: str = ""                   # 用户的 sec_uid（抖音视频与直播监控共用; B 站留空）
     nickname: str = ""                  # 缓存的用户昵称
     # 视频监控状态
     last_video_id: Optional[str] = None  # 最后推送的视频ID
