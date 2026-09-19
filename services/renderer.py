@@ -20,6 +20,7 @@ from astrbot.api.all import Star
 
 from ..core.models import LiveInfo, UserInfo, VideoInfo
 from ..core.utils import build_live_url, build_video_url, first_url, format_number
+from .card_renderer import CardRenderer
 
 # 插件根目录
 plugin_dir = Path(__file__).resolve().parent.parent
@@ -65,10 +66,25 @@ LIVE_END_TEXT = """⚫ {nickname} 已下播
 class Renderer:
     """消息渲染器"""
 
-    def __init__(self, star: Star, rai: bool = False):
+    def __init__(self, star: Star, rai: bool = False, engine: str = "local",
+                 font_path: str = "", card_quality: int = 80):
         self.star = star
         self.rai = rai
+        # 图片卡片的渲染引擎: local = Pillow 本地自绘(默认, 不依赖外部服务)
+        #                     html  = AstrBot html_render(远程 t2i, 带校验与重试)
+        self.engine = (engine or "local").strip().lower()
+        if self.engine not in ("local", "html"):
+            logger.warning(f"未知的 card_engine={engine}, 回退为 local")
+            self.engine = "local"
         self._templates = {}
+        self.cards: Optional[CardRenderer] = None
+        if rai:
+            try:
+                self.cards = CardRenderer(font_path=font_path, quality=card_quality)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"本地卡片渲染器初始化失败, 将改用 html 渲染: {e}")
+                self.cards = None
+                self.engine = "html"
 
     def _load_template(self, name: str) -> Optional[str]:
         """加载 HTML 模板"""
@@ -86,7 +102,36 @@ class Renderer:
             logger.error(f"加载模板 {name} 失败: {e}")
             return None
 
-    async def _render_card(self, tmpl_name: str, data: dict) -> Optional[str]:
+    async def _render_card(self, tmpl_name: str, data: dict,
+                           local_kind: str = "video") -> Optional[str]:
+        """
+        渲染卡片图片(按 card_engine 分派)。
+
+        local: Pillow 本地自绘 —— 内存 ~30MB、单张 ~30ms、不依赖任何外部服务,
+               小内存机器上的默认选择。
+        html : AstrBot 内置 html_render(远程 t2i 服务), 带「校验 + 重试」。
+        """
+        if not self.rai:
+            return None
+        if self.engine == "html" or self.cards is None:
+            return await self._render_card_html(tmpl_name, data)
+        return await self._render_card_local(local_kind, data)
+
+    async def _render_card_local(self, kind: str, data: dict) -> Optional[str]:
+        """本地 Pillow 自绘(阻塞操作已在线程池里执行)"""
+        try:
+            if kind == "live":
+                img_path = await self.cards.arender_live_card(data)
+            else:
+                img_path = await self.cards.arender_video_card(data)
+            if img_path:
+                logger.info(f"卡片渲染成功(本地): {img_path}{self._size_hint(img_path)}")
+            return img_path
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"本地卡片渲染失败, 本次降级: {e}")
+            return None
+
+    async def _render_card_html(self, tmpl_name: str, data: dict) -> Optional[str]:
         """
         使用 AstrBot 内置 html_render 渲染卡片图片。
 
@@ -100,8 +145,6 @@ class Renderer:
         """
         tmpl_str = self._load_template(tmpl_name)
         if not tmpl_str:
-            return None
-        if not self.rai:
             return None
 
         for attempt in range(1, CARD_MAX_ATTEMPTS + 1):
@@ -188,7 +231,7 @@ class Renderer:
             "collect_count": collect,
             "share_count": share,
             "url": url,
-        })
+        }, local_kind="video")
 
         return text, img_path
 
@@ -225,7 +268,8 @@ class Renderer:
             "avatar": avatar,
             "title": title,
             "url": url,
-        })
+            "is_live": is_live,
+        }, local_kind="live")
 
         return text, img_path
 

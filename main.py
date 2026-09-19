@@ -48,7 +48,7 @@ RECONNECT_SILENT_PADDING_SECS = 60
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.1.1",
+    "1.2.0",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -68,7 +68,13 @@ class Main(Star):
 
         # 3. 初始化渲染器
         self.rai = self.cfg.get("rai", False)
-        self.renderer = Renderer(star=self, rai=self.rai)
+        self.renderer = Renderer(
+            star=self,
+            rai=self.rai,
+            engine=str(self.cfg.get("card_engine", "local") or "local"),
+            font_path=str(self.cfg.get("font_path", "") or ""),
+            card_quality=int(self.cfg.get("card_quality", 80) or 80),
+        )
 
         # 4. 初始化订阅服务
         self.subscription_service = SubscriptionService(self.data_manager)

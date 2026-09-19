@@ -58,9 +58,27 @@
         "default": ""
     },
     "rai": {
-        "description": "是否启用图片渲染模式（需要 AstrBot HTML 渲染支持）",
+        "description": "是否启用图片卡片推送（渲染引擎由 card_engine 决定）",
         "type": "bool",
         "default": false
+    },
+    "card_engine": {
+        "description": "图片卡片的渲染引擎：local=Pillow 本地自绘（不依赖任何外部渲染服务，推荐）；html=AstrBot 文转图（远程 t2i 服务，可能不稳定）",
+        "type": "string",
+        "options": ["local", "html"],
+        "default": "local"
+    },
+    "card_quality": {
+        "description": "本地卡片的 JPEG 质量（50-95，越高越清晰体积越大）",
+        "type": "int",
+        "default": 80,
+        "minimum": 50,
+        "maximum": 95
+    },
+    "font_path": {
+        "description": "本地卡片使用的中文字体文件路径（留空自动探测系统字体）",
+        "type": "string",
+        "default": ""
     },
     "render_cache_limit": {
         "description": "渲染结果缓存条数上限（同一视频被多个会话订阅时只渲染一次）",
