@@ -59,12 +59,6 @@ class Renderer:
         self.star = star
         self.rai = rai
         self._templates = {}
-        # 最近一次渲染结果 (供 /dy_status、/dy_img_test 诊断图片格式与体积)
-        self.last_card_path: Optional[str] = None
-        self.last_card_size: int = 0
-        self.last_card_format: str = ""
-        # 最近一次渲染失败的原因 (成功时清空) —— 推送一直失败时这是最关键的一条线索
-        self.last_card_error: str = ""
 
     def _load_template(self, name: str) -> Optional[str]:
         """加载 HTML 模板"""
@@ -97,72 +91,20 @@ class Renderer:
                 options=CARD_RENDER_OPTIONS,
             )
             if img_path:
-                fmt, size, head, complete = self._sniff_image(img_path)
-                if not fmt or not size or not complete:
-                    # 渲染服务异常时可能返回 HTML/JSON 错误页、空内容或半截数据。这类内容不是
-                    # 有效图片, 协议端(QQ)会在富媒体上传阶段直接失败(rich media transfer
-                    # failed), 发出去只会白挨一次报错, 因此这里直接放弃图片、降级为纯文本。
-                    reason = "数据不完整(疑似被截断)" if (fmt and not complete) else "不是有效图片"
-                    self.last_card_error = f"{reason} (格式={fmt or '未知'}, {size} 字节)"
-                    # 不要把坏图记成"最近一次成功渲染", 否则 /dy_img_test 会拿它去重试
-                    self.last_card_path = None
-                    self.last_card_size = 0
-                    self.last_card_format = ""
-                    logger.warning(
-                        f"卡片渲染结果{reason} (格式={fmt or '未知'}, {size} 字节, "
-                        f"前 16 字节: {head or '空'}), 文件: {img_path} —— "
-                        f"多为 t2i 渲染服务返回了错误内容或下载不完整, 本次降级为纯文本"
-                    )
-                    return None
-                self.last_card_path = img_path
-                self.last_card_size = size
-                self.last_card_format = fmt
-                self.last_card_error = ""
-                logger.info(f"卡片渲染成功: {img_path} ({fmt}, {size / 1024:.0f} KB)")
+                logger.info(f"卡片渲染成功: {img_path}{self._size_hint(img_path)}")
             return img_path
         except Exception as e:
-            self.last_card_error = f"渲染异常: {' '.join(str(e).split())[:120]}"
             logger.warning(f"卡片渲染失败，降级为纯文本: {e}")
             return None
 
     @staticmethod
-    def _sniff_image(img_path: str) -> Tuple[str, int, str, bool]:
-        """
-        校验渲染结果是不是**完整**的图片。
-
-        返回 (格式, 字节数, 前16字节hex, 是否完整)。
-        读不到文件或格式无法识别时格式为空串。
-        除了 magic bytes, 还检查文件尾 (PNG 的 IEND / JPEG 的 FFD9),
-        用来发现"下载了一半"的图片 —— 这种图照样能通过头部检查, 但上传必定失败。
-        """
+    def _size_hint(img_path: str) -> str:
+        """渲染结果的文件大小提示 (图片体积过大是协议端推送失败的常见原因)"""
         try:
-            size = Path(img_path).stat().st_size
-            with open(img_path, "rb") as f:
-                head = f.read(16)
-                f.seek(max(0, size - 16))
-                tail = f.read(16)
+            size_kb = Path(img_path).stat().st_size / 1024
         except OSError:
-            return "", 0, "", False
-
-        fmt = ""
-        complete = True
-        if head.startswith(b"\x89PNG\r\n\x1a\n"):
-            fmt = "PNG"
-            complete = b"IEND" in tail
-        elif head.startswith(b"\xff\xd8\xff"):
-            fmt = "JPEG"
-            complete = tail.endswith(b"\xff\xd9")
-        elif head.startswith(b"GIF8"):
-            fmt = "GIF"
-            complete = tail.endswith(b";")
-        elif head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-            fmt = "WEBP"
-        elif head.startswith(b"BM"):
-            fmt = "BMP"
-        elif head[4:12] in (b"ftypavif", b"ftypavis"):
-            fmt = "AVIF"
-
-        return fmt, size, head.hex(" "), complete
+            return ""
+        return f" ({size_kb:.0f} KB)"
 
     async def render_video(self, work: dict, nickname: str = "") -> Tuple[str, Optional[str]]:
         """

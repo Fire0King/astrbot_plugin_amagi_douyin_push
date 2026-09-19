@@ -1,16 +1,11 @@
 import asyncio
-import base64
-import re
-import struct
-import zlib
 from pathlib import Path
 from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.all import *
-from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.event import AstrMessageEvent
 from astrbot.api.event.filter import command, permission_type, PermissionType
-from astrbot.api.message_components import Image as CompImage
 from astrbot.core.star.filter.command import GreedyStr
 
 from .core.data_manager import DataManager
@@ -31,32 +26,6 @@ from .services.subscription_service import SubscriptionService
 # 插件根目录
 plugin_dir = Path(__file__).parent
 
-
-def _build_probe_png(width: int = 64, height: int = 64) -> str:
-    """
-    生成一张纯色 PNG 并返回 base64。
-
-    仅用于 /dy_img_test: 它体积极小(约 130 字节), 用来验证协议端(NapCat/QQ)的
-    图片上传通道本身是否可用 —— 与图片体积无关。即时生成, 免去外部文件与
-    易出错的长 base64 常量。
-    """
-    raw = b"".join(b"\x00" + bytes([0x2B, 0x9C, 0xD6]) * width for _ in range(height))
-
-    def _chunk(tag: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + tag + data
-                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + _chunk(b"IDAT", zlib.compress(raw, 9))
-        + _chunk(b"IEND", b"")
-    )
-    return base64.b64encode(png).decode()
-
-
-_PROBE_PNG_B64 = _build_probe_png()
-
 # ==================== 数据源说明 ====================
 # 本插件的数据源为 amagi (https://github.com/ikenxuan/amagi, Node.js SDK):
 #   - amagi 不再以 git 子模块分发 (WebUI 安装不会拉子模块, 会导致目录为空),
@@ -71,7 +40,7 @@ _PROBE_PNG_B64 = _build_probe_png()
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.8",
+    "1.0.5",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -582,14 +551,6 @@ class Main(Star):
         amagi_ready = "✅ 已就绪" if bridge["built"] else "❌ 未就绪"
         bridge_err = bridge["last_error"] or bridge["build_msg"]
 
-        card_state = "🟢 开启" if self.cfg.get('rai', False) else "🔴 关闭(纯文本)"
-        if self.renderer.last_card_error:
-            last_card = f"❌ {self.renderer.last_card_error} ← 推送失败多半就是它"
-        elif self.renderer.last_card_size:
-            last_card = f"{self.renderer.last_card_format}, {self.renderer.last_card_size / 1024:.0f} KB"
-        else:
-            last_card = "无(本进程未成功渲染)"
-
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
@@ -603,105 +564,11 @@ class Main(Star):
             f"直播监控: {'🟢 开启' if self.cfg.get('enable_live_monitor', True) else '🔴 关闭'}\n"
             f"订阅总数: {total_subs} (视频 {video_subs} / 直播 {live_subs})\n"
             f"{'=' * 20}\n"
-            f"图片卡片(rai): {card_state}\n"
-            f"上次卡片图: {last_card}\n"
-            f"{'=' * 20}\n"
             f"amagi 桥接: {bridge_state} ({bridge['port']})\n"
             f"amagi 运行时: {amagi_ready} (v{bridge['amagi_version']})\n"
             f"说明: {bridge_err}"
         )
         yield event.plain_result(msg)
-
-    @staticmethod
-    def _brief_err(e: Exception) -> str:
-        """把协议端异常压成一行 (保留 retcode 与关键错误信息)"""
-        text = " ".join(str(e).split())
-        code = ""
-        m = re.search(r"retcode=(-?\d+)", text)
-        if m:
-            code = f"retcode={m.group(1)} "
-        if "rich media transfer failed" in text:
-            return f"{code}rich media transfer failed (QQ 富媒体上传失败)"
-        return f"{code}{text[:120]}"
-
-    @command("dy_img_test")
-    @permission_type(PermissionType.ADMIN)
-    async def dy_img_test(self, event: AstrMessageEvent):
-        """图片推送通道自检（管理员）：定位图片发送失败发生在哪一环"""
-        lines = ["🧪 图片推送通道自检", "=" * 20]
-
-        # 探针 1: 内置极小 PNG(base64) —— 只验证协议端(NapCat/QQ)的图片上传通道
-        tiny_ok: Optional[bool] = None
-        try:
-            await self.context.send_message(
-                event.unified_msg_origin,
-                MessageChain([CompImage.fromBase64(_PROBE_PNG_B64)]),
-            )
-            tiny_ok = True
-            lines.append("内置小图 (64x64, 136B): ✅ 发送成功")
-        except Exception as e:  # noqa: BLE001
-            tiny_ok = False
-            lines.append(f"内置小图 (64x64, 136B): ❌ {self._brief_err(e)}")
-
-        # 探针 2: 上一次真实渲染的卡片图 —— 与探针 1 对比即可判断「体积」是否是元凶
-        card_ok: Optional[bool] = None
-        path = self.renderer.last_card_path
-        size_kb = self.renderer.last_card_size / 1024
-        card_label = f"上次卡片图 ({self.renderer.last_card_format or '格式未知'}, {size_kb:.0f} KB)"
-        if path and Path(path).exists():
-            try:
-                await self.context.send_message(
-                    event.unified_msg_origin,
-                    MessageChain([CompImage.fromFileSystem(path)]),
-                )
-                card_ok = True
-                lines.append(f"{card_label}: ✅ 发送成功")
-            except Exception as e:  # noqa: BLE001
-                card_ok = False
-                lines.append(f"{card_label}: ❌ {self._brief_err(e)}")
-        else:
-            lines.append("上次卡片图: ⏭ 无可用缓存 (本进程还没成功渲染出有效卡片)")
-            if self.renderer.last_card_error:
-                lines.append(
-                    f"  上次渲染结果: ❌ {self.renderer.last_card_error}"
-                    f"  ← 但日志里有具体字节数, 这就是推送失败的原因"
-                )
-
-        lines.append("=" * 20)
-        render_err = self.renderer.last_card_error
-        if tiny_ok is False:
-            lines.append(
-                "结论: 连 136 字节的小图都发不出去 → 问题在协议端(NapCat/QQ)的图片通道本身, "
-                "与图片体积无关。请重启 NapCat 重新登录、把 NapCat 与 QQ 升级到匹配版本, "
-                "并确认该账号未被限制发送图片/未被风控。"
-            )
-        elif tiny_ok and card_ok is False:
-            lines.append(
-                f"结论: 小图能发、卡片图发不出 → 是卡片图本身的问题 ({card_label})。"
-                "若格式为 PNG/JPEG 等常见格式, 说明是体积过大 → 调低 services/renderer.py 里 "
-                "CARD_RENDER_OPTIONS 的 quality(如 50), 或缩小卡片宽度; "
-                "若格式为「格式未知」, 说明 t2i 渲染服务返回的不是图片, 请检查 AstrBot 的文转图设置。"
-            )
-        elif tiny_ok and render_err:
-            lines.append(
-                f"结论: 协议端图片通道正常, 但卡片根本没能渲染出有效图片 ({render_err}) → "
-                "问题在 AstrBot 的「文转图」渲染/下载环节, 与协议端、图片体积都无关。"
-                "典型表现是 AstrBot 的 t2i 服务返回空内容仍被存成 .jpg(0 字节)。"
-                "请检查 AstrBot 的文转图端点设置(或自部署 t2i 服务), "
-                "在此之前建议先把本插件的 rai 关掉用纯文本推送。"
-            )
-        elif tiny_ok and card_ok:
-            lines.append(
-                f"结论: 小图与卡片图 ({card_label}) 都能发出 → 通道正常, "
-                "之前的失败多为瞬时问题(网络抖动/上传超时), 可继续观察。"
-            )
-        else:
-            lines.append(
-                "结论: 极小图片可正常发送; 要判定卡片图, 请先执行 /dy_test <抖音用户> "
-                "(或等一次真实推送)渲染出卡片, 再重跑本命令。"
-            )
-
-        yield event.plain_result("\n".join(lines))
 
     # ==================== 生命周期 ====================
 
