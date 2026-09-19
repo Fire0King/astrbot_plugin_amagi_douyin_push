@@ -63,6 +63,8 @@ class Renderer:
         self.last_card_path: Optional[str] = None
         self.last_card_size: int = 0
         self.last_card_format: str = ""
+        # 最近一次渲染失败的原因 (成功时清空) —— 推送一直失败时这是最关键的一条线索
+        self.last_card_error: str = ""
 
     def _load_template(self, name: str) -> Optional[str]:
         """加载 HTML 模板"""
@@ -97,10 +99,15 @@ class Renderer:
             if img_path:
                 fmt, size, head, complete = self._sniff_image(img_path)
                 if not fmt or not size or not complete:
-                    # 渲染服务异常时可能返回 HTML/JSON 错误页或半截数据。这类内容不是有效图片,
-                    # 协议端(QQ)会在富媒体上传阶段直接失败(rich media transfer failed),
-                    # 发出去只会白挨一次报错, 因此这里直接放弃图片、降级为纯文本。
-                    reason = "数据不完整(疑似被截断)" if (fmt and not complete) else "不是图片"
+                    # 渲染服务异常时可能返回 HTML/JSON 错误页、空内容或半截数据。这类内容不是
+                    # 有效图片, 协议端(QQ)会在富媒体上传阶段直接失败(rich media transfer
+                    # failed), 发出去只会白挨一次报错, 因此这里直接放弃图片、降级为纯文本。
+                    reason = "数据不完整(疑似被截断)" if (fmt and not complete) else "不是有效图片"
+                    self.last_card_error = f"{reason} (格式={fmt or '未知'}, {size} 字节)"
+                    # 不要把坏图记成"最近一次成功渲染", 否则 /dy_img_test 会拿它去重试
+                    self.last_card_path = None
+                    self.last_card_size = 0
+                    self.last_card_format = ""
                     logger.warning(
                         f"卡片渲染结果{reason} (格式={fmt or '未知'}, {size} 字节, "
                         f"前 16 字节: {head or '空'}), 文件: {img_path} —— "
@@ -110,9 +117,11 @@ class Renderer:
                 self.last_card_path = img_path
                 self.last_card_size = size
                 self.last_card_format = fmt
+                self.last_card_error = ""
                 logger.info(f"卡片渲染成功: {img_path} ({fmt}, {size / 1024:.0f} KB)")
             return img_path
         except Exception as e:
+            self.last_card_error = f"渲染异常: {' '.join(str(e).split())[:120]}"
             logger.warning(f"卡片渲染失败，降级为纯文本: {e}")
             return None
 

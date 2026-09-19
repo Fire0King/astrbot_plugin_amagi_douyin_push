@@ -71,7 +71,7 @@ _PROBE_PNG_B64 = _build_probe_png()
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.7",
+    "1.0.8",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -583,8 +583,12 @@ class Main(Star):
         bridge_err = bridge["last_error"] or bridge["build_msg"]
 
         card_state = "🟢 开启" if self.cfg.get('rai', False) else "🔴 关闭(纯文本)"
-        last_card = (f"{self.renderer.last_card_format}, {self.renderer.last_card_size / 1024:.0f} KB"
-                     if self.renderer.last_card_size else "无(本进程未成功渲染)")
+        if self.renderer.last_card_error:
+            last_card = f"❌ {self.renderer.last_card_error} ← 推送失败多半就是它"
+        elif self.renderer.last_card_size:
+            last_card = f"{self.renderer.last_card_format}, {self.renderer.last_card_size / 1024:.0f} KB"
+        else:
+            last_card = "无(本进程未成功渲染)"
 
         msg = (
             f"📊 插件运行状态\n"
@@ -656,9 +660,15 @@ class Main(Star):
                 card_ok = False
                 lines.append(f"{card_label}: ❌ {self._brief_err(e)}")
         else:
-            lines.append("上次卡片图: ⏭ 无本地缓存 (本进程还没成功渲染过卡片)")
+            lines.append("上次卡片图: ⏭ 无可用缓存 (本进程还没成功渲染出有效卡片)")
+            if self.renderer.last_card_error:
+                lines.append(
+                    f"  上次渲染结果: ❌ {self.renderer.last_card_error}"
+                    f"  ← 但日志里有具体字节数, 这就是推送失败的原因"
+                )
 
         lines.append("=" * 20)
+        render_err = self.renderer.last_card_error
         if tiny_ok is False:
             lines.append(
                 "结论: 连 136 字节的小图都发不出去 → 问题在协议端(NapCat/QQ)的图片通道本身, "
@@ -671,6 +681,14 @@ class Main(Star):
                 "若格式为 PNG/JPEG 等常见格式, 说明是体积过大 → 调低 services/renderer.py 里 "
                 "CARD_RENDER_OPTIONS 的 quality(如 50), 或缩小卡片宽度; "
                 "若格式为「格式未知」, 说明 t2i 渲染服务返回的不是图片, 请检查 AstrBot 的文转图设置。"
+            )
+        elif tiny_ok and render_err:
+            lines.append(
+                f"结论: 协议端图片通道正常, 但卡片根本没能渲染出有效图片 ({render_err}) → "
+                "问题在 AstrBot 的「文转图」渲染/下载环节, 与协议端、图片体积都无关。"
+                "典型表现是 AstrBot 的 t2i 服务返回空内容仍被存成 .jpg(0 字节)。"
+                "请检查 AstrBot 的文转图端点设置(或自部署 t2i 服务), "
+                "在此之前建议先把本插件的 rai 关掉用纯文本推送。"
             )
         elif tiny_ok and card_ok:
             lines.append(
