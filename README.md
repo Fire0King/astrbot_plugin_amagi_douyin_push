@@ -327,6 +327,38 @@ amagi 的直播间接口要求同时提供内部 `room_id` 与 `web_rid`，无�
 3. 用 `/dy_status` 查看「推送状态」（是否处于重连静默）与「上次推送成功」时间，
    确认通知是否只是被静默模式丢弃。
 
+### Q10: 日志每 60 秒重复刷 `已启动 amagi 桥接 (pid=...)` / `amagi 桥接就绪`？
+
+**原因**：这两行**只在"重新拉起了一个 node 进程"时打印**，桥接健康时整个生命周期只出现一次。
+每 60 秒（= `poll_interval`）成对出现且 **pid 每次都变**，说明插件认定桥接"没在运行"，于是每个
+轮询周期都重新拉起一个 —— 而真正在干活的是**上一个进程没退干净留下的残留进程**：
+
+```
+残留进程占着 48211
+  → 插件新拉起的进程 listen 失败, 但旧版 server.mjs 会**无条件打印 ready** 后静默退出
+  → 插件的健康检查被残留进程的响应骗过(握手成功 → 判定"就绪")
+  → 下一轮发现子进程已死 → 再拉一个 …… 死循环(全程不报错)
+```
+
+**判断方法**（在宿主机执行）：
+
+```bash
+nsenter -t $(docker inspect -f '{{.State.Pid}}' astrbot) -n ss -lptnp | grep 48211   # 谁在监听
+docker exec astrbot grep -c ready /AstrBot/data/plugin_data/astrbot_plugin_amagi_douyin_push/amagi_bridge/bridge.out.log
+docker logs -t astrbot | grep -c "已启动 amagi 桥接"
+```
+
+若监听者的 pid **不在**日志里那串 pid 中，就是残留进程。
+
+**解决**：
+
+1. 执行 `/dy_bridge_restart`（v1.1.1 起会自动清理残留进程后重启）；
+2. 或手动结束残留进程：`kill $(nsenter -t <容器pid> -n ss -lptnp | awk '/48211/{match($0,/pid=[0-9]+/);print substr($0,RSTART+4,RLENGTH-4)}')`，
+   等一个轮询周期，插件会拉起一个能正常绑定的桥接（本次循环随即停止）；
+3. v1.1.1 起 `amagi_bridge/server.mjs` 会**先做端口预检**并在监听失败时**大声报错退出**，
+   不再出现"假就绪 + 静默自杀"；插件侧也会检测到"端口已有监听但不是我拉起的进程"并**直接复用**，
+   不再盲目重复拉起。
+
 ---
 
 ## 📄 许可证

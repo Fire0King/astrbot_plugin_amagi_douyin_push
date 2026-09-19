@@ -28,6 +28,7 @@ amagi 桥接服务管理 (Python 侧)
 import asyncio
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -163,6 +164,8 @@ class AmagiService:
         self._last_err: str = ""
         self._ready_attempted_at: float = 0.0
         self._warn_cookie: bool = False
+        # 拉起桥接必须串行: 视频循环与直播循环是并发任务, 靠"3 秒时间窗"防重入并不可靠
+        self._start_lock = asyncio.Lock()
 
     # ---------------- 状态 ----------------
 
@@ -370,31 +373,55 @@ class AmagiService:
 
     async def ensure_started(self):
         """确保桥接进程已启动; 未配置 Cookie / amagi 未就绪则记录原因并返回"""
-        if self.running and self._started:
-            return True
+        async with self._start_lock:
+            if self.running and self._started:
+                return True
 
-        if not self.cookie_configured:
-            if not self._warn_cookie:
-                logger.warning("抖音 Cookie 未配置 (douyin_cookie), 跳过启动 amagi 桥接")
-                self._warn_cookie = True
-            return False
+            if not self.cookie_configured:
+                if not self._warn_cookie:
+                    logger.warning("抖音 Cookie 未配置 (douyin_cookie), 跳过启动 amagi 桥接")
+                    self._warn_cookie = True
+                return False
 
-        await self.prepare()
-        if not self._build_ok:
-            logger.warning("amagi 未就绪, 无法启动桥接: " + self._build_msg)
-            return False
-        if not self.server_script.exists():
-            logger.error(f"缺少桥接脚本: {self.server_script}")
-            return False
+            await self.prepare()
+            if not self._build_ok:
+                logger.warning("amagi 未就绪, 无法启动桥接: " + self._build_msg)
+                return False
+            if not self.server_script.exists():
+                logger.error(f"缺少桥接脚本: {self.server_script}")
+                return False
 
-        # 距上次尝试 3 秒内不重复尝试, 防止多个协程同时拉起
-        now = time.monotonic()
-        if now - self._ready_attempted_at < 3:
-            return self.running and self._started
-        self._ready_attempted_at = now
+            # 端口已有监听者: 先弄清是不是"我们自己的子进程"
+            #
+            # 为什么必须先探端口: 桥接是被 reload/terminate 时可能没被杀干净的。
+            # 残留进程占着端口时, 再拉起的新进程必然 EADDRINUSE 并立刻退出, 但
+            # 健康检查会被**残留进程的响应**骗过(握手成功), 于是插件每个轮询周期
+            # 都白拉一个进程、日志成对刷屏、pid 一直变 —— 复用即可根治。
+            if await asyncio.to_thread(self._probe, 1.0):
+                owner = await asyncio.to_thread(self._port_listener_pid)
+                if self._proc and self._proc.returncode is None and (
+                        owner is None or owner == self._proc.pid):
+                    self._started = True
+                    return True
+                # 不是本次拉起的进程在监听 → 直接复用, 不再拉起注定失败的进程
+                self._started = True
+                self._last_err = ""
+                logger.warning(
+                    f"端口 {self.port} 已有桥接在监听 (pid={owner if owner else '未知'}, "
+                    f"不是当前子进程) —— 直接复用, 不再重复拉起。"
+                    f"这通常是上次重载/退出时没清理干净的残留进程; "
+                    f"需要彻底重启请执行 /dy_bridge_restart"
+                )
+                return True
 
-        # 旧进程清理
-        await self._terminate_proc()
+            # 距上次尝试 3 秒内不重复尝试, 防止多个协程同时拉起
+            now = time.monotonic()
+            if now - self._ready_attempted_at < 3:
+                return self.running and self._started
+            self._ready_attempted_at = now
+
+            # 旧进程清理
+            await self._terminate_proc()
 
         env = dict(os.environ)
         env["DOUYIN_COOKIE"] = self.cookie
@@ -444,7 +471,8 @@ class AmagiService:
             return False
         self._started = True
         self._last_err = ""
-        logger.info(f"amagi 桥接就绪: http://{self.host}:{self.port}")
+        pid = self._proc.pid if self._proc else "?"
+        logger.info(f"amagi 桥接就绪: http://{self.host}:{self.port} (pid={pid})")
         return True
 
     def _probe(self, timeout: float = 1) -> bool:
@@ -454,6 +482,89 @@ class AmagiService:
             return True
         except requests.RequestException:
             return False
+
+    @staticmethod
+    def _port_listener_pid(port: int, proc_root: str = "/proc") -> Optional[int]:
+        """
+        找出正在 LISTEN 指定端口的进程 pid (Linux; 其它平台/查不到时返回 None)。
+
+        做法: 从 /proc/net/tcp{,6} 里找到该端口 LISTEN 套接字的 inode,
+        再在 /proc/<pid>/fd/* 里找出持有该 inode 的进程。
+        不依赖 ss/lsof (AstrBot 容器里通常没装这些工具)。
+        """
+        try:
+            inodes = set()
+            for name in ("tcp", "tcp6"):
+                try:
+                    with open(f"{proc_root}/net/{name}", "r", encoding="utf-8") as f:
+                        next(f, None)   # 跳过表头
+                        for line in f:
+                            parts = line.split()
+                            if len(parts) < 10 or parts[3] != "0A":   # 0A = LISTEN
+                                continue
+                            try:
+                                if int(parts[1].rsplit(":", 1)[-1], 16) != port:
+                                    continue
+                            except ValueError:
+                                continue
+                            inodes.add(parts[9])
+                except OSError:
+                    continue
+            if not inodes:
+                return None
+
+            for entry in os.listdir(proc_root):
+                if not entry.isdigit():
+                    continue
+                fd_dir = os.path.join(proc_root, entry, "fd")
+                try:
+                    fds = os.listdir(fd_dir)
+                except OSError:
+                    continue
+                for fd in fds:
+                    try:
+                        target = os.readlink(os.path.join(fd_dir, fd))
+                    except OSError:
+                        continue
+                    if target.startswith("socket:[") and target[8:-1] in inodes:
+                        return int(entry)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"查找端口 {port} 的监听进程失败: {e}")
+        return None
+
+    async def _kill_port_owner(self) -> bool:
+        """
+        结束"占着端口但不是本次拉起的子进程"的残留桥接进程。
+
+        只有 /dy_bridge_restart 会走到这里 —— 那是用户显式要求"彻底重启"的动作,
+        可以动手清理残留; 日常 ensure_started 只复用, 不会去杀进程。
+        """
+        owner = await asyncio.to_thread(self._port_listener_pid, self.port)
+        if owner is None:
+            return False
+        if self._proc and owner == self._proc.pid:
+            return False
+        if owner == os.getpid():
+            return False
+
+        logger.warning(f"清理残留桥接进程 pid={owner} (占用端口 {self.port}, 但不是当前子进程)")
+        try:
+            os.kill(owner, signal.SIGTERM)
+        except OSError as e:
+            logger.error(f"结束残留进程 pid={owner} 失败: {e}")
+            return False
+
+        for _ in range(20):
+            await asyncio.sleep(0.25)
+            if not await asyncio.to_thread(self._probe, 0.5):
+                logger.info(f"残留进程 pid={owner} 已退出, 端口 {self.port} 已释放")
+                return True
+        try:
+            os.kill(owner, getattr(signal, "SIGKILL", signal.SIGTERM))
+            logger.warning(f"残留进程 pid={owner} 未响应 SIGTERM, 已强制结束")
+        except OSError as e:
+            logger.error(f"强制结束残留进程 pid={owner} 失败: {e}")
+        return True
 
     async def _wait_ready(self, timeout: float = 20) -> bool:
         """轮询 /ping 直到端口可连接 (说明服务已监听)"""
@@ -482,12 +593,21 @@ class AmagiService:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"终止桥接进程出错: {e}")
 
+        # 杀完之后端口必须真的被释放; 没释放说明有残留进程, 这是后面一切异常的根源
+        if await asyncio.to_thread(self._probe, 0.5):
+            owner = await asyncio.to_thread(self._port_listener_pid, self.port)
+            logger.warning(
+                f"桥接进程已结束, 但端口 {self.port} 仍在监听 (pid={owner if owner else '未知'}) —— "
+                f"存在残留进程; 需要彻底清理请执行 /dy_bridge_restart"
+            )
+
     async def stop(self):
         await self._terminate_proc()
 
     async def restart(self):
         """重启桥接 (用于 Cookie 变更后); 会强制重新检查/安装 amagi 运行时"""
         await self._terminate_proc()
+        await self._kill_port_owner()
         self._ready_attempted_at = 0.0
         await self.prepare(force=True)
         return await self.ensure_started()
