@@ -73,7 +73,8 @@ class Main(Star):
             rai=self.rai,
             engine=str(self.cfg.get("card_engine", "local") or "local"),
             font_path=str(self.cfg.get("font_path", "") or ""),
-            card_quality=int(self.cfg.get("card_quality", 80) or 80),
+            card_quality=int(self.cfg.get("card_quality", 88) or 88),
+            card_scale=float(self.cfg.get("card_scale", 0) or 0),
         )
 
         # 4. 初始化订阅服务

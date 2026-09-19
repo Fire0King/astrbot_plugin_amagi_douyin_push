@@ -67,7 +67,8 @@ class Renderer:
     """消息渲染器"""
 
     def __init__(self, star: Star, rai: bool = False, engine: str = "local",
-                 font_path: str = "", card_quality: int = 80):
+                 font_path: str = "", card_quality: int = 88,
+                 card_scale: float = 0.0):
         self.star = star
         self.rai = rai
         # 图片卡片的渲染引擎: local = Pillow 本地自绘(默认, 不依赖外部服务)
@@ -80,7 +81,8 @@ class Renderer:
         self.cards: Optional[CardRenderer] = None
         if rai:
             try:
-                self.cards = CardRenderer(font_path=font_path, quality=card_quality)
+                self.cards = CardRenderer(font_path=font_path, quality=card_quality,
+                                          scale=card_scale)
             except Exception as e:  # noqa: BLE001
                 logger.error(f"本地卡片渲染器初始化失败, 将改用 html 渲染: {e}")
                 self.cards = None

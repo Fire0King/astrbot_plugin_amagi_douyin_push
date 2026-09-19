@@ -71,9 +71,16 @@
     "card_quality": {
         "description": "本地卡片的 JPEG 质量（50-95，越高越清晰体积越大）",
         "type": "int",
-        "default": 80,
+        "default": 88,
         "minimum": 50,
         "maximum": 95
+    },
+    "card_scale": {
+        "description": "本地卡片的输出倍率（设计稿 404 逻辑像素 × 该倍率）：4≈1616px（与 B 站插件卡片同级，推荐）；1=404px（偏小）",
+        "type": "int",
+        "default": 4,
+        "minimum": 1,
+        "maximum": 6
     },
     "font_path": {
         "description": "本地卡片使用的中文字体文件路径（留空自动探测系统字体）",

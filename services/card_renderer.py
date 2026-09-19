@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 # ==================== 版式常量 (与 assets/templates/*.html 对齐) ====================
 BG_COLOR = (0x1A, 0x1A, 0x2E)          # 页面背景(深蓝黑)
@@ -40,6 +40,15 @@ COVER_BG = (0xF0, 0xF0, 0xF0)
 AVATAR_BG = (0xE6, 0xE6, 0xEA)
 
 COVER_BOX_H = 420                      # 封面展示区高度(contain 适配)
+
+# ==================== 输出倍率 ====================
+# 版式按"设计单位"排版(卡片宽 380, 与 assets/templates/*.html 一致), 绘制时整体乘以该倍率。
+# 为什么需要: B 站插件走 html 渲染, 输出是 800 CSS px × device_scale_factor 1.8 ≈ 1440px 宽,
+# 而本地 1:1 绘制只有 404px —— 在 QQ 里看着明显偏小、也不够清晰。
+# 默认 4.0 → 404 × 4 ≈ 1616px, 与 B 站插件同级(它约 1440px);
+# 文字是按倍率用矢量重绘的(不是位图放大), 所以放大后依然锐利。
+DEFAULT_SCALE = 4.0
+MAX_SCALE = 6.0
 
 # 中文字体候选(按优先级); 前面的更好看
 _FONT_CANDIDATES: Sequence[str] = (
@@ -229,18 +238,30 @@ def _draw_dot(d: ImageDraw.ImageDraw, x: float, y: float, size: int, color):
 class CardRenderer:
     """用 Pillow 画视频/直播卡片"""
 
-    def __init__(self, font_path: str = "", quality: int = 80):
-        self.quality = max(50, min(95, int(quality or 80)))
+    def __init__(self, font_path: str = "", quality: int = 88,
+                 scale: float = DEFAULT_SCALE):
+        self.quality = max(50, min(95, int(quality or 88)))
+        try:
+            self.scale = max(1.0, min(MAX_SCALE, float(scale or DEFAULT_SCALE)))
+        except (TypeError, ValueError):
+            self.scale = DEFAULT_SCALE
         self.font_path = find_cjk_font(font_path or "")
         self._font_cache: Dict[Tuple[int, bool], ImageFont.FreeTypeFont] = {}
         if self.font_path:
-            logger.info(f"卡片渲染使用字体: {self.font_path}")
+            logger.info(
+                f"卡片渲染使用字体: {self.font_path} "
+                f"(输出倍率 {self.scale:g}x, 成品宽度约 {int((CARD_WIDTH + 2 * PAGE_PAD) * self.scale)}px)"
+            )
         else:
             logger.warning("未找到可用的中文字体, 卡片中文可能显示为方框(可用 font_path 指定)")
 
         data_dir = StarTools.get_data_dir(plugin_name="astrbot_plugin_amagi_douyin_push")
         self.out_dir = Path(data_dir) / "cards"
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _u(self, value: float) -> int:
+        """设计单位 → 输出像素"""
+        return int(round(value * self.scale))
 
     # ---------------- 字体 ----------------
 
@@ -316,6 +337,7 @@ class CardRenderer:
     # ---------------- 视频卡片 ----------------
 
     def render_video_card(self, data: dict) -> Optional[str]:
+        u = self._u
         nickname = str(data.get("nickname") or "抖音用户")
         title = str(data.get("title") or "")
         url = str(data.get("url") or "")
@@ -326,93 +348,107 @@ class CardRenderer:
             (_draw_share, str(data.get("share_count") or "0")),
         ]
 
-        f_nick = self.font(16, bold=True)
-        f_tag = self.font(12, bold=True)
-        f_title = self.font(15)
-        f_stat = self.font(12)
-        f_url = self.font(11)
-        f_avatar = self.font(18, bold=True)
+        f_nick = self.font(u(16), bold=True)
+        f_tag = self.font(u(12), bold=True)
+        f_title = self.font(u(15))
+        f_stat = self.font(u(12))
+        f_url = self.font(u(11))
+        f_avatar = self.font(u(18), bold=True)
 
         avatar = self._load_image(str(data.get("avatar") or ""))
         cover = self._load_image(str(data.get("cover") or ""))
 
-        inner_w = CARD_WIDTH - 32           # 卡片左右各 16px 内边距
+        card_w = u(CARD_WIDTH)
+        inner_w = card_w - u(32)            # 卡片左右各 16 设计单位内边距
+        pad = u(PAGE_PAD)
 
-        # --- 预估高度 ---
-        header_h = 68
+        # --- 预估高度(全部为输出像素) ---
+        header_h = u(68)
         cover_h = 0
         cover_img = None
         if cover is not None:
-            cover_img = _fit_contain(cover.convert("RGB"), CARD_WIDTH, COVER_BOX_H)
+            cover_img = _fit_contain(cover.convert("RGB"), card_w, u(COVER_BOX_H))
             cover_h = cover_img.height
 
         probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
         title_lines = _wrap_text(probe, title, f_title, inner_w, max_lines=2)
-        title_h = len(title_lines) * 21
-        stats_h = 20
+        line_h = u(21)
+        title_h = len(title_lines) * line_h
+        stats_h = u(20)
         url_lines = _wrap_text(probe, url, f_url, inner_w, max_lines=1)
-        url_h = 16 if url_lines else 0
-        body_h = 12 + title_h + (10 if title_lines else 0) + stats_h + (8 if url_h else 0) + url_h + 14
+        url_h = u(16) if url_lines else 0
+        body_h = (u(12) + title_h + (u(10) if title_lines else 0) + stats_h
+                  + (u(8) if url_h else 0) + url_h + u(14))
 
         card_h = header_h + cover_h + body_h
-        canvas = Image.new("RGB", (CARD_WIDTH + PAGE_PAD * 2, card_h + PAGE_PAD * 2), BG_COLOR)
+        canvas = Image.new("RGB", (card_w + pad * 2, card_h + pad * 2), BG_COLOR)
         draw = ImageDraw.Draw(canvas)
 
         # --- 卡片底 ---
-        card_x, card_y = PAGE_PAD, PAGE_PAD
+        card_x, card_y = pad, pad
         draw.rounded_rectangle(
-            (card_x, card_y, card_x + CARD_WIDTH, card_y + card_h),
-            radius=CARD_RADIUS, fill=CARD_COLOR,
+            (card_x, card_y, card_x + card_w, card_y + card_h),
+            radius=u(CARD_RADIUS), fill=CARD_COLOR,
         )
 
         # --- 头部: 头像 + 昵称 + 标签 ---
-        avatar_img = _circle_avatar(avatar, 40, nickname, f_avatar)
-        canvas.paste(avatar_img, (card_x + 16, card_y + 14), avatar_img)
+        avatar_size = u(40)
+        avatar_img = _circle_avatar(avatar, avatar_size, nickname, f_avatar)
+        avatar_xy = (card_x + u(16), card_y + u(14))
+        canvas.paste(avatar_img, avatar_xy, avatar_img)
         draw = ImageDraw.Draw(canvas)
         # 头像描边(抖音红)
-        draw.ellipse((card_x + 16, card_y + 14, card_x + 56, card_y + 54), outline=ACCENT, width=2)
+        draw.ellipse((avatar_xy[0], avatar_xy[1],
+                      avatar_xy[0] + avatar_size, avatar_xy[1] + avatar_size),
+                     outline=ACCENT, width=max(2, u(2)))
 
-        draw.text((card_x + 66, card_y + 18), _ellipsize(probe, nickname, f_nick, inner_w - 60),
+        draw.text((card_x + u(66), card_y + u(18)),
+                  _ellipsize(probe, nickname, f_nick, inner_w - u(60)),
                   font=f_nick, fill=TEXT_MAIN)
-        _draw_play(draw, card_x + 66, card_y + 42, 9, ACCENT)
-        draw.text((card_x + 80, card_y + 39), "新视频", font=f_tag, fill=ACCENT)
+        _draw_play(draw, card_x + u(66), card_y + u(42), u(9), ACCENT)
+        draw.text((card_x + u(80), card_y + u(39)), "新视频", font=f_tag, fill=ACCENT)
 
         y = card_y + header_h
 
         # --- 封面 ---
         if cover_img is not None:
-            draw.rectangle((card_x, y, card_x + CARD_WIDTH, y + cover_h), fill=COVER_BG)
-            # contain 缩放后宽度可能不足卡片宽, 必须水平居中(等价 CSS 的 text-align/居中)
-            canvas.paste(cover_img, (card_x + (CARD_WIDTH - cover_img.width) // 2, y))
+            # 竖版封面 contain 后两侧必然留白: 用封面自身的模糊放大版铺底,
+            # 比纯色留白好看得多(尺寸与版式不变, 只是换了底色)
+            backdrop = _fit_cover(cover.convert("RGB"), card_w, cover_h)
+            backdrop = backdrop.filter(ImageFilter.GaussianBlur(u(18)))
+            canvas.paste(backdrop, (card_x, y))
+            # contain 缩放后宽度可能不足卡片宽, 必须水平居中(等价 CSS 的居中)
+            canvas.paste(cover_img, (card_x + (card_w - cover_img.width) // 2, y))
             draw = ImageDraw.Draw(canvas)
             y += cover_h
 
         # --- 正文 ---
-        y += 12
+        y += u(12)
         for line in title_lines:
-            draw.text((card_x + 16, y), line, font=f_title, fill=TEXT_BODY)
-            y += 21
+            draw.text((card_x + u(16), y), line, font=f_title, fill=TEXT_BODY)
+            y += line_h
         if title_lines:
-            y += 10
+            y += u(10)
 
-        x = card_x + 16
+        x = card_x + u(16)
         for icon_fn, value in stats:
-            icon_fn(draw, x, y + 2, 13, TEXT_WEAK)
-            x += 17
+            icon_fn(draw, x, y + u(2), u(13), TEXT_WEAK)
+            x += u(17)
             draw.text((x, y), value, font=f_stat, fill=(0x55, 0x55, 0x55))
-            x += int(draw.textlength(value, font=f_stat)) + 14
-            if x > card_x + CARD_WIDTH - 30:
+            x += int(draw.textlength(value, font=f_stat)) + u(14)
+            if x > card_x + card_w - u(30):
                 break
 
         if url_lines:
-            y += stats_h + 8
-            draw.text((card_x + 16, y), url_lines[0], font=f_url, fill=TEXT_FAINT)
+            y += stats_h + u(8)
+            draw.text((card_x + u(16), y), url_lines[0], font=f_url, fill=TEXT_FAINT)
 
         return self._save(canvas, "v")
 
     # ---------------- 直播卡片 ----------------
 
     def render_live_card(self, data: dict) -> Optional[str]:
+        u = self._u
         nickname = str(data.get("nickname") or "抖音主播")
         title = str(data.get("title") or "无标题")
         url = str(data.get("url") or "")
@@ -420,54 +456,64 @@ class CardRenderer:
         badge_text = "直播中" if is_live else "已下播"
         badge_color = ACCENT if is_live else OFFLINE_GRAY
 
-        f_badge = self.font(12, bold=True)
-        f_nick = self.font(16, bold=True)
-        f_title = self.font(15)
-        f_url = self.font(11)
-        f_avatar = self.font(22, bold=True)
+        f_badge = self.font(u(12), bold=True)
+        f_nick = self.font(u(16), bold=True)
+        f_title = self.font(u(15))
+        f_url = self.font(u(11))
+        f_avatar = self.font(u(22), bold=True)
 
         avatar = self._load_image(str(data.get("avatar") or ""))
 
-        inner_w = CARD_WIDTH - 32
+        card_w = u(CARD_WIDTH)
+        inner_w = card_w - u(32)
+        pad = u(PAGE_PAD)
+
         probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
         title_lines = _wrap_text(probe, title, f_title, inner_w, max_lines=3)
         url_lines = _wrap_text(probe, url, f_url, inner_w, max_lines=1)
 
-        header_h = 84
-        body_h = 12 + len(title_lines) * 21 + (8 + 16 if url_lines else 0) + 14
+        header_h = u(84)
+        line_h = u(21)
+        body_h = (u(12) + len(title_lines) * line_h
+                  + (u(8) + u(16) if url_lines else 0) + u(14))
         card_h = header_h + body_h
 
-        canvas = Image.new("RGB", (CARD_WIDTH + PAGE_PAD * 2, card_h + PAGE_PAD * 2), BG_COLOR)
+        canvas = Image.new("RGB", (card_w + pad * 2, card_h + pad * 2), BG_COLOR)
         draw = ImageDraw.Draw(canvas)
-        card_x, card_y = PAGE_PAD, PAGE_PAD
-        draw.rounded_rectangle((card_x, card_y, card_x + CARD_WIDTH, card_y + card_h),
-                               radius=CARD_RADIUS, fill=CARD_COLOR)
+        card_x, card_y = pad, pad
+        draw.rounded_rectangle((card_x, card_y, card_x + card_w, card_y + card_h),
+                               radius=u(CARD_RADIUS), fill=CARD_COLOR)
 
-        avatar_img = _circle_avatar(avatar, 56, nickname, f_avatar)
-        canvas.paste(avatar_img, (card_x + 16, card_y + 14), avatar_img)
+        avatar_size = u(56)
+        avatar_img = _circle_avatar(avatar, avatar_size, nickname, f_avatar)
+        avatar_xy = (card_x + u(16), card_y + u(14))
+        canvas.paste(avatar_img, avatar_xy, avatar_img)
         draw = ImageDraw.Draw(canvas)
-        draw.ellipse((card_x + 16, card_y + 14, card_x + 72, card_y + 70),
-                     outline=badge_color, width=2)
+        draw.ellipse((avatar_xy[0], avatar_xy[1],
+                      avatar_xy[0] + avatar_size, avatar_xy[1] + avatar_size),
+                     outline=badge_color, width=max(2, u(2)))
 
-        draw.text((card_x + 84, card_y + 16), _ellipsize(probe, nickname, f_nick, inner_w - 80),
+        draw.text((card_x + u(84), card_y + u(16)),
+                  _ellipsize(probe, nickname, f_nick, inner_w - u(80)),
                   font=f_nick, fill=TEXT_MAIN)
 
-        # 徽标胶囊
-        bw = int(draw.textlength(badge_text, font=f_badge)) + 30
+        # 徽标: 直播中 = 实心圆点, 已下播 = 空心圈
+        dot_y = card_y + u(49)
         if is_live:
-            _draw_dot(draw, card_x + 88, card_y + 49, 8, badge_color)
+            _draw_dot(draw, card_x + u(88), dot_y, u(8), badge_color)
         else:
-            draw.ellipse((card_x + 88, card_y + 49, card_x + 96, card_y + 57),
-                         outline=badge_color, width=2)
-        draw.text((card_x + 102, card_y + 46), badge_text, font=f_badge, fill=badge_color)
+            draw.ellipse((card_x + u(88), dot_y, card_x + u(96), dot_y + u(8)),
+                         outline=badge_color, width=max(2, u(2)))
+        draw.text((card_x + u(102), card_y + u(46)), badge_text,
+                  font=f_badge, fill=badge_color)
 
         y = card_y + header_h
         for line in title_lines:
-            draw.text((card_x + 16, y), line, font=f_title, fill=TEXT_BODY)
-            y += 21
+            draw.text((card_x + u(16), y), line, font=f_title, fill=TEXT_BODY)
+            y += line_h
         if url_lines:
-            y += 8
-            draw.text((card_x + 16, y), url_lines[0], font=f_url, fill=TEXT_FAINT)
+            y += u(8)
+            draw.text((card_x + u(16), y), url_lines[0], font=f_url, fill=TEXT_FAINT)
 
         return self._save(canvas, "l")
 
