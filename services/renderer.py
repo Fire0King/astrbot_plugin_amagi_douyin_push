@@ -5,8 +5,13 @@
   使用 HTML 模板 + AstrBot 内置 html_render 生成卡片图片。
 纯文本模式（rai=false）：
   直接返回格式化的纯文本消息。
+
+渲染结果一律经过校验：拿到路径不等于拿到图片 —— 上游 t2i 服务可能返回空内容
+或错误页，这类"图片"发到协议端必然失败，因此这里校验 + 重试，失败则返回 None
+由调用方降级。
 """
 
+import asyncio
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -35,6 +40,11 @@ CARD_RENDER_OPTIONS = {
     "quality": 75,
     "scale": "css",
 }
+
+# ==================== 渲染结果校验 / 重试 ====================
+CARD_MAX_ATTEMPTS = 3           # 最多尝试次数
+CARD_RETRY_DELAY = 2            # 两次尝试之间的间隔(秒)
+CARD_MIN_IMAGE_BYTES = 4096     # 小于此体积一律视为无效(空响应/错误页远小于它)
 
 # ==================== 纯文本消息模板 ====================
 
@@ -77,29 +87,68 @@ class Renderer:
             return None
 
     async def _render_card(self, tmpl_name: str, data: dict) -> Optional[str]:
-        """使用 AstrBot 内置 html_render 渲染卡片图片"""
+        """
+        使用 AstrBot 内置 html_render 渲染卡片图片。
+
+        渲染服务可能偶发返回空内容或错误页, 只判断"有没有拿到路径"是不够的,
+        因此这里做「校验 + 重试」:
+          - 文件必须存在, 且体积大于 CARD_MIN_IMAGE_BYTES
+          - 必须能被 PIL 完整解码(HTML/JSON 错误页、被截断的图在这里被拒)
+          - 最多尝试 CARD_MAX_ATTEMPTS 次, 间隔 CARD_RETRY_DELAY 秒
+
+        全部尝试失败返回 None, 由调用方降级为「纯文本 + 封面图」。
+        """
         tmpl_str = self._load_template(tmpl_name)
         if not tmpl_str:
             return None
         if not self.rai:
             return None
+
+        for attempt in range(1, CARD_MAX_ATTEMPTS + 1):
+            try:
+                img_path = await self.star.html_render(
+                    tmpl=tmpl_str,
+                    data=data,
+                    return_url=False,
+                    options=CARD_RENDER_OPTIONS,
+                )
+                if (
+                    img_path
+                    and Path(img_path).exists()
+                    and Path(img_path).stat().st_size > CARD_MIN_IMAGE_BYTES
+                    and self._validate_image(img_path)
+                ):
+                    logger.info(f"卡片渲染成功: {img_path}{self._size_hint(img_path)}")
+                    return img_path
+                logger.warning(
+                    f"卡片渲染结果无效 (尝试 {attempt}/{CARD_MAX_ATTEMPTS}): "
+                    f"{img_path}{self._size_hint(img_path) or ' (文件不存在)'}"
+                )
+            except Exception as e:
+                logger.error(f"渲染图片失败 (尝试 {attempt}/{CARD_MAX_ATTEMPTS}): {e}")
+
+            if attempt < CARD_MAX_ATTEMPTS:
+                await asyncio.sleep(CARD_RETRY_DELAY)
+
+        logger.warning(f"渲染图片失败: 已尝试 {CARD_MAX_ATTEMPTS} 次, 本次降级")
+        return None
+
+    @staticmethod
+    def _validate_image(img_path: str) -> bool:
+        """验证图片文件是否有效可读(PIL 能完整解码)"""
         try:
-            img_path = await self.star.html_render(
-                tmpl=tmpl_str,
-                data=data,
-                return_url=False,
-                options=CARD_RENDER_OPTIONS,
-            )
-            if img_path:
-                logger.info(f"卡片渲染成功: {img_path}{self._size_hint(img_path)}")
-            return img_path
+            from PIL import Image
+
+            with Image.open(img_path) as img:
+                img.verify()
+            return True
         except Exception as e:
-            logger.warning(f"卡片渲染失败，降级为纯文本: {e}")
-            return None
+            logger.warning(f"图片验证失败 {img_path}: {e}")
+            return False
 
     @staticmethod
     def _size_hint(img_path: str) -> str:
-        """渲染结果的文件大小提示 (图片体积过大是协议端推送失败的常见原因)"""
+        """渲染结果的文件大小提示"""
         try:
             size_kb = Path(img_path).stat().st_size / 1024
         except OSError:

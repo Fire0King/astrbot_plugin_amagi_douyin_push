@@ -1,7 +1,21 @@
 """抖音插件工具函数"""
 
+import os
 import re
 from typing import Optional
+
+from astrbot.api import logger
+from PIL import Image as PILImage
+
+# 图片文件体积上限: 超过则不再作为图片发送, 改为退化成文件发送
+MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024
+
+# 通用平台图片高度上限
+MAX_IMAGE_HEIGHT = 25000
+
+# Telegram 特殊限制: (宽 + 高) 与长宽比的硬上限
+TELEGRAM_MAX_SIDE_SUM = 10000
+TELEGRAM_MAX_ASPECT_RATIO = 20
 
 
 def parse_sec_uid(text: str) -> Optional[str]:
@@ -84,3 +98,36 @@ def build_video_url(aweme_id: str) -> str:
 def build_live_url(room_id: str) -> str:
     """构建抖音直播 URL"""
     return f"https://live.douyin.com/{room_id}"
+
+
+def is_height_valid(img_path: str, platform_name: str = "",
+                    max_height: int = MAX_IMAGE_HEIGHT) -> bool:
+    """
+    检查图片能否作为**图片**消息发送 (而不是退化成文件)。
+
+    各平台对图片的尺寸与体积限制不同, 超限时平台会直接拒绝, 因此调用方应当在
+    返回 False 时改用 File 组件发送, 否则图片会发不出去。
+
+    - 体积 > 10MB: 一律不允许
+    - Telegram: (宽 + 高) <= 10000 且 长边/短边 <= 20
+    - 其他平台: 高度 <= 25000 (如 QQ 的长图限制)
+    """
+    try:
+        if os.path.getsize(img_path) > MAX_IMAGE_FILE_BYTES:
+            return False
+
+        with PILImage.open(img_path) as img:
+            width, height = img.size
+
+        if platform_name == "telegram":
+            if (width + height) > TELEGRAM_MAX_SIDE_SUM:
+                return False
+            longer, shorter = max(width, height), min(width, height)
+            if shorter > 0 and (longer / shorter) > TELEGRAM_MAX_ASPECT_RATIO:
+                return False
+            return True
+
+        return height <= max_height
+    except Exception as e:
+        logger.error(f"无法打开图片 {img_path} 进行尺寸检查: {e}")
+        return False

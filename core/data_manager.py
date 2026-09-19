@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
 from astrbot.api.star import StarTools
@@ -16,8 +16,13 @@ class DataManager:
         data_dir = StarTools.get_data_dir(plugin_name="astrbot_plugin_amagi_douyin_push")
         os.makedirs(data_dir, exist_ok=True)
         self.subscriptions_file = os.path.join(data_dir, "subscriptions.json")
+        # 运行状态单独存一个文件: 订阅文件是 {会话: [订阅记录]} 的结构,
+        # 混入元信息会破坏加载逻辑
+        self.state_file = os.path.join(data_dir, "state.json")
         self._subscriptions: Dict[str, List[SubscriptionRecord]] = {}
+        self._state: Dict[str, Any] = {}
         self._load()
+        self._load_state()
 
     def _load(self):
         """从文件加载订阅数据"""
@@ -99,3 +104,37 @@ class DataManager:
             if r.uid == uid and r.sub_type == sub_type:
                 return r
         return None
+
+    # ==================== 运行状态 ====================
+
+    def _load_state(self):
+        """加载运行状态(上次推送成功时间等)"""
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            if isinstance(state, dict):
+                self._state = state
+        except Exception as e:
+            logger.error(f"加载运行状态失败: {e}")
+
+    def _save_state(self):
+        """保存运行状态"""
+        try:
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(self._state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存运行状态失败: {e}")
+
+    def get_last_success_sub_notify_ts(self) -> int:
+        """上次成功推送订阅通知的时间戳(秒), 0 表示从未成功"""
+        try:
+            return int(self._state.get("last_success_sub_notify_ts", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def set_last_success_sub_notify_ts(self, ts: int) -> None:
+        """记录上次成功推送订阅通知的时间戳(秒)"""
+        self._state["last_success_sub_notify_ts"] = int(ts)
+        self._save_state()

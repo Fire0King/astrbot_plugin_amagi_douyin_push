@@ -1,10 +1,11 @@
 import asyncio
 import time
-from typing import Optional
+from collections import OrderedDict
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
-from astrbot.api.message_components import AtAll, Image, Plain
+from astrbot.api.message_components import AtAll, File, Image, Plain
 from astrbot.core.star import Context
 
 from ..core.data_manager import DataManager
@@ -16,11 +17,26 @@ from ..core.douyin import (
     is_pinned,
 )
 from ..core.models import SubscriptionRecord
-from ..core.utils import build_user_url, build_video_url
+from ..core.utils import (
+    build_user_url,
+    build_video_url,
+    first_url,
+    is_height_valid,
+)
+from .dispatcher import SubscriptionNotification, SubscriptionNotificationDispatcher
 from .renderer import Renderer
 
 # 「桥接未就绪」提示的最小间隔(秒), 避免每个轮询周期刷屏
 _NOT_READY_LOG_INTERVAL = 300
+
+# 渲染结果缓存条数上限(按内容 ID 缓存, 多个会话订阅同一主播时复用)
+_RENDER_CACHE_LIMIT = 32
+
+# @全体成员可用性判定: 剩余次数的最小值
+_MIN_AT_ALL_REMAINING = 1
+
+# 会话类型: 只有群聊才可能 @全体
+_GROUP_MESSAGE_TYPE = "GroupMessage"
 
 
 class DouyinListener:
@@ -32,16 +48,24 @@ class DouyinListener:
             data_manager: DataManager,
             amagi,
             renderer: Renderer,
-            cfg: dict
+            cfg: dict,
+            dispatcher: Optional[SubscriptionNotificationDispatcher] = None,
     ):
         self.context = context
         self.data_manager = data_manager
         self.amagi = amagi
         self.renderer = renderer
         self.cfg = cfg
+        self.dispatcher = dispatcher or SubscriptionNotificationDispatcher(context)
 
         self.interval_secs = max(10, int(cfg.get("poll_interval", 60)))
         self.enable_live = cfg.get("enable_live_monitor", True)
+
+        # 渲染结果缓存: content_id -> (文本, 图片路径)
+        self._render_cache: "OrderedDict[str, Tuple[str, Optional[str]]]" = OrderedDict()
+        self._render_cache_limit = max(
+            1, int(cfg.get("render_cache_limit", _RENDER_CACHE_LIMIT))
+        )
 
         self._running = False
         self._video_task: Optional[asyncio.Task] = None
@@ -293,52 +317,238 @@ class DouyinListener:
             nickname=latest[3].get('author', {}).get('nickname', record.nickname),
         )
 
+    # ==================== 渲染结果缓存 ====================
+
+    def _get_cached_render(self, content_id: str) -> Optional[Tuple[str, Optional[str]]]:
+        """
+        读取渲染结果缓存。
+
+        图片文件可能已被系统清理, 因此命中后仍要确认文件还在, 否则视为未命中。
+        """
+        if not content_id:
+            return None
+        cached = self._render_cache.get(content_id)
+        if not cached:
+            return None
+        text, img_path = cached
+        if img_path and not Path(img_path).exists():
+            self._render_cache.pop(content_id, None)
+            return None
+        self._render_cache.move_to_end(content_id)
+        return cached
+
+    def _cache_render(self, content_id: str, text: str, img_path: Optional[str]) -> None:
+        """缓存渲染结果(仅缓存成功渲染出图片的情况)"""
+        if not content_id or not img_path:
+            return
+        self._render_cache[content_id] = (text, img_path)
+        self._render_cache.move_to_end(content_id)
+        while len(self._render_cache) > self._render_cache_limit:
+            self._render_cache.popitem(last=False)
+
+    # ==================== 消息链构建 ====================
+
+    def _resolve_platform_name(self, sub_user: str) -> str:
+        """解析会话所属平台适配器的类型名(如 aiocqhttp / telegram)"""
+        adapter_id = sub_user.split(":", 1)[0] if ":" in sub_user else ""
+        if not adapter_id:
+            return ""
+        platform_inst = self.context.get_platform_inst(adapter_id)
+        if platform_inst:
+            return platform_inst.meta().name
+        return ""
+
     @staticmethod
-    def _build_text_chain(at_all: bool, text: str) -> MessageChain:
-        """构建纯文本消息链 (图片发送失败时的降级方案)"""
-        chain = MessageChain()
+    def _build_text_chain(at_all: bool, text: str, image_url: str = "") -> list:
+        """
+        构建纯文本消息链 (渲染失败或图片发送失败时的降级方案)。
+
+        image_url 非空时附上一张**平台原图**(抖音封面/头像): 它由协议端自己去下载,
+        不经过 t2i 渲染服务, 因此即使渲染链路整体不可用, 推送里依然有图可看。
+        """
+        parts: list = []
         if at_all:
-            chain.at_all()
-        chain.message(text)
-        return chain
+            parts.append(AtAll())
+        parts.append(Plain(text))
+        if image_url:
+            parts.append(Image.fromURL(image_url))
+        return parts
 
-    async def _send_text_fallback(self, sub_user: str, at_all: bool, text: str, err: Exception):
+    def _build_image_chain(self, img_path: str, sub_user: str, at_all: bool,
+                           caption: str, name_prefix: str) -> list:
         """
-        图片发送失败时降级为纯文本重发, 保证推送不丢。
+        构建图片消息链。
 
-        图片推送失败在协议端很常见, 例如 QQ 富媒体上传失败
-        (`rich media transfer failed`, retcode 1200)。
-        由于图片与链接在同一条消息链里, 失败会导致**整条推送**丢失,
-        因此这里用带链接的纯文本兜底重发。
+        各平台对图片尺寸/体积有硬限制, 超限的图片会被直接拒收, 因此这里先做
+        尺寸自适应: 超限时退化成发送文件(File), 保证内容仍然送得到。
         """
-        logger.warning(f"卡片图片发送失败, 降级为纯文本重发: {err}")
-        await self.context.send_message(sub_user, self._build_text_chain(at_all, text))
+        parts: list = []
+        if at_all:
+            parts.append(AtAll())
+
+        if is_height_valid(img_path, self._resolve_platform_name(sub_user)):
+            parts.append(Image.fromFileSystem(img_path))
+        else:
+            timestamp = int(time.time())
+            parts.append(File(file=img_path, name=f"{name_prefix}_{timestamp}.jpg"))
+            logger.info(f"图片超出平台尺寸/体积限制, 改为文件发送: {img_path}")
+
+        parts.append(Plain(f"\n{caption}"))
+        return parts
+
+    # ==================== @全体成员权限 ====================
+
+    @staticmethod
+    def _extract_group_session(sub_user: str) -> Optional[Tuple[str, str]]:
+        """从 UMO 中解析出 (平台ID, 群号); 非群聊返回 None"""
+        try:
+            platform_id, message_type, session_id = sub_user.split(":", 2)
+        except ValueError:
+            return None
+        if message_type != _GROUP_MESSAGE_TYPE:
+            return None
+        group_id = session_id.split("_")[-1].strip()
+        if not group_id:
+            return None
+        return platform_id, group_id
+
+    @staticmethod
+    def _extract_action_data(action_result) -> dict:
+        """兼容 OneBot 接口返回 {data: {...}} 与直接返回 {...} 两种形态"""
+        if not isinstance(action_result, dict):
+            return {}
+        payload = action_result.get("data")
+        if isinstance(payload, dict):
+            return payload
+        return action_result
+
+    async def _check_atall_permission(self, sub_user: str, enabled: bool) -> bool:
+        """
+        发送 @全体 之前先确认机器人**真的**有权限。
+
+        没有权限时 @全体 会被协议端静默忽略(或整个发送失败), 与其发出去没效果,
+        不如提前判定并放弃 @全体 —— 消息本身照常推送。
+        """
+        if not enabled:
+            return False
+
+        group_ctx = self._extract_group_session(sub_user)
+        if not group_ctx:
+            logger.info(f"@全体仅支持群聊会话, 当前会话: {sub_user}")
+            return False
+
+        platform_id, group_id = group_ctx
+        platform_inst = self.context.get_platform_inst(platform_id)
+        if not platform_inst:
+            logger.warning(f"@全体检查失败: 找不到平台实例 {platform_id}")
+            return False
+
+        client = platform_inst.get_client()
+        if not client or not hasattr(client, "call_action"):
+            logger.warning(f"@全体检查失败: 平台 {platform_id} 不支持 call_action")
+            return False
+
+        group_id_param: "int | str" = int(group_id) if group_id.isdigit() else group_id
+
+        # 先看机器人自身在群里的角色: 部分实现下 get_group_at_all_remain 并不可靠
+        try:
+            bot_info = self._extract_action_data(
+                await client.call_action("get_login_info")
+            )
+            bot_id = bot_info.get("user_id")
+            if bot_id:
+                member_info = self._extract_action_data(
+                    await client.call_action(
+                        "get_group_member_info",
+                        group_id=group_id_param,
+                        user_id=bot_id,
+                    )
+                )
+                role = member_info.get("role")
+                if role and role not in ("admin", "owner"):
+                    logger.info(
+                        f"机器人在群 {group_id} 的角色为 {role}, 无 @全体 权限, 本次不 @全体"
+                    )
+                    return False
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"通过 get_group_member_info 检查 @全体 权限失败: {e}")
+
+        try:
+            remain_data = self._extract_action_data(
+                await client.call_action(
+                    "get_group_at_all_remain", group_id=group_id_param
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"调用 get_group_at_all_remain 失败: {e}")
+            return False
+
+        if not bool(remain_data.get("can_at_all")):
+            logger.info(f"群 {group_id} 当前不允许 @全体成员, 本次不 @全体")
+            return False
+
+        group_remain = int(remain_data.get("remain_at_all_count_for_group", 0) or 0)
+        self_remain = int(
+            remain_data.get(
+                "remain_at_all_count_for_self",
+                remain_data.get("remain_at_all_count_for_uin", 0),
+            )
+            or 0
+        )
+        if group_remain < _MIN_AT_ALL_REMAINING or self_remain < _MIN_AT_ALL_REMAINING:
+            logger.info(
+                f"群 {group_id} @全体次数不足: group={group_remain}, self={self_remain}"
+            )
+            return False
+        return True
+
+    # ==================== 视频 / 直播推送 ====================
 
     async def _push_video_message(self, sub_user: str, record: SubscriptionRecord, work: dict):
         """推送视频消息"""
         try:
             nickname = work.get('author', {}).get('nickname', record.nickname or record.uid)
             aweme_id = str(work.get('aweme_id', ''))
+            url = build_video_url(aweme_id)
+            cover = first_url(work.get('video', {}).get('cover'))
 
-            # 使用渲染器生成消息（返回文本 + 可选图片）
-            text, img_path = await self.renderer.render_video(work, nickname)
+            # 同一视频被多个会话订阅时只渲染一次
+            cached = self._get_cached_render(aweme_id)
+            if cached:
+                logger.debug(f"视频渲染命中缓存: {aweme_id}")
+                text, img_path = cached
+            else:
+                text, img_path = await self.renderer.render_video(work, nickname)
+                self._cache_render(aweme_id, text, img_path)
+
+            at_all = await self._check_atall_permission(sub_user, bool(record.at_all))
 
             if img_path:
-                # 构建 MessageChain
-                chain = MessageChain()
-                if record.at_all:
-                    chain.at_all()
-                chain.file_image(img_path)
-                url = build_video_url(aweme_id)
-                chain.message(f"\n{url}")
-                try:
-                    await self.context.send_message(sub_user, chain)
-                except Exception as e:  # noqa: BLE001
-                    await self._send_text_fallback(sub_user, record.at_all, text, e)
+                result = await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_image_chain(
+                        img_path, sub_user, at_all, url, f"douyin_video_{aweme_id}"
+                    ),
+                    category="video",
+                    content_id=aweme_id,
+                ))
+                if not result.sent and not result.dropped:
+                    # 图片这一步失败(如协议端富媒体上传失败)时, 图与链接在同一条消息里,
+                    # 整条推送都会丢, 因此降级重发「纯文本 + 抖音封面原图」
+                    logger.warning(f"视频图片推送失败, 降级重发: {result.reason}")
+                    await self.dispatcher.publish(SubscriptionNotification(
+                        sub_user=sub_user,
+                        chain_parts=self._build_text_chain(at_all, text, cover),
+                        category="video",
+                        content_id=aweme_id,
+                    ))
             else:
-                await self.context.send_message(
-                    sub_user, self._build_text_chain(record.at_all, text)
-                )
+                await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_text_chain(at_all, text, cover),
+                    category="video",
+                    content_id=aweme_id,
+                ))
 
             logger.info(f"已向 {sub_user} 推送视频: {aweme_id}")
         except Exception as e:
@@ -447,30 +657,45 @@ class DouyinListener:
         extra = extra or {}
 
         try:
+            avatar = str(extra.get("avatar", "") or "")
+
             # 使用渲染器生成消息（返回文本 + 可选图片）
             text, img_path = await self.renderer.render_live(
                 record, is_live, title,
-                avatar=extra.get("avatar", ""),
+                avatar=avatar,
             )
 
-            at_all = is_live and (record.live_atall or record.at_all)
+            url = build_user_url(record.sec_uid)
+            # 只有开播才 @全体 (下播不打扰), 且要先确认机器人真有权限
+            at_all = await self._check_atall_permission(
+                sub_user, bool(is_live and (record.live_atall or record.at_all))
+            )
 
             if img_path:
-                # 构建 MessageChain
-                chain = MessageChain()
-                if at_all:
-                    chain.at_all()
-                chain.file_image(img_path)
-                url = build_user_url(record.sec_uid)
-                chain.message(f"\n{url}")
-                try:
-                    await self.context.send_message(sub_user, chain)
-                except Exception as e:  # noqa: BLE001
-                    await self._send_text_fallback(sub_user, at_all, text, e)
+                result = await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_image_chain(
+                        img_path, sub_user, at_all, url,
+                        f"douyin_live_{record.sec_uid}",
+                    ),
+                    category="live",
+                    content_id=str(record.sec_uid or record.uid),
+                ))
+                if not result.sent and not result.dropped:
+                    logger.warning(f"直播图片推送失败, 降级重发: {result.reason}")
+                    await self.dispatcher.publish(SubscriptionNotification(
+                        sub_user=sub_user,
+                        chain_parts=self._build_text_chain(at_all, text, avatar),
+                        category="live",
+                        content_id=str(record.sec_uid or record.uid),
+                    ))
             else:
-                await self.context.send_message(
-                    sub_user, self._build_text_chain(at_all, text)
-                )
+                await self.dispatcher.publish(SubscriptionNotification(
+                    sub_user=sub_user,
+                    chain_parts=self._build_text_chain(at_all, text, avatar),
+                    category="live",
+                    content_id=str(record.sec_uid or record.uid),
+                ))
 
             logger.info(f"已向 {sub_user} 推送直播状态: {'开播' if is_live else '下播'}")
         except Exception as e:

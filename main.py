@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,12 +20,19 @@ from .core.douyin import (
 from .core.models import SubscriptionRecord
 from .core.utils import build_user_url, format_number, parse_sec_uid
 from .services.amagi_service import AmagiService
+from .services.dispatcher import SubscriptionNotificationDispatcher
 from .services.listener import DouyinListener
 from .services.renderer import Renderer
 from .services.subscription_service import SubscriptionService
 
 # 插件根目录
 plugin_dir = Path(__file__).parent
+
+# ==================== 重连静默 ====================
+# 距上次成功推送超过阈值时, 认为中间积压了更新, 恢复后先静默一段时间
+RECONNECT_SILENT_THRESHOLD_SECS = 6 * 3600
+# 静默时长 = 一个轮询周期 + 该余量
+RECONNECT_SILENT_PADDING_SECS = 60
 
 # ==================== 数据源说明 ====================
 # 本插件的数据源为 amagi (https://github.com/ikenxuan/amagi, Node.js SDK):
@@ -40,7 +48,7 @@ plugin_dir = Path(__file__).parent
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.0.5",
+    "1.1.0",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -65,25 +73,72 @@ class Main(Star):
         # 4. 初始化订阅服务
         self.subscription_service = SubscriptionService(self.data_manager)
 
-        # 5. 初始化监听服务
+        # 5. 初始化通知发送器 (统一出口: 静默模式 / 发送结果 / 成功回调)
+        self._last_notify_write_ts = self.data_manager.get_last_success_sub_notify_ts()
+        self.dispatcher = SubscriptionNotificationDispatcher(
+            context=self.context,
+            on_sent=self._on_subscription_notification_sent,
+        )
+
+        # 6. 初始化监听服务
         self.listener = DouyinListener(
             context=self.context,
             data_manager=self.data_manager,
             amagi=self.amagi,
             renderer=self.renderer,
-            cfg=self.cfg
+            cfg=self.cfg,
+            dispatcher=self.dispatcher,
         )
+        # 长时间没成功推送过(如断电/断网/长期失败)时先静默一段时间, 避免恢复瞬间刷屏
+        self._configure_reconnect_silent()
 
-        # 6. 后台准备并启动 amagi 桥接 (运行时缺失时自动 npm 安装)
+        # 7. 后台准备并启动 amagi 桥接 (运行时缺失时自动 npm 安装)
         self._amagi_task: Optional[asyncio.Task] = None
         asyncio.create_task(self._boot_amagi())
 
-        # 7. 启动后台监听
+        # 8. 启动后台监听
         self._listener_task: Optional[asyncio.Task] = None
         self._start_listener()
 
         if not cookie:
             logger.warning("⚠️ 抖音 Cookie 未配置, 请先在插件设置中配置 douyin_cookie")
+
+    async def _on_subscription_notification_sent(self, _notification) -> None:
+        """推送成功回调: 记录时间(同一秒内不重复写盘)"""
+        now_ts = int(time.time())
+        if now_ts == self._last_notify_write_ts:
+            return
+        self._last_notify_write_ts = now_ts
+        self.data_manager.set_last_success_sub_notify_ts(now_ts)
+
+    def _configure_reconnect_silent(self) -> None:
+        """
+        重连静默: 若距上次成功推送已超过阈值(默认 6 小时), 认为中间积压了大量更新,
+        先静默一个轮询周期 + 60 秒, 避免一次性把积压内容全部推出去刷屏。
+        """
+        if not bool(self.cfg.get("reconnect_silent", False)):
+            self.dispatcher.set_silent_until_ts(0)
+            return
+
+        last_success_ts = self.data_manager.get_last_success_sub_notify_ts()
+        if last_success_ts <= 0:
+            logger.info("重连静默未触发: 缺少历史推送成功时间。")
+            return
+
+        now_ts = int(time.time())
+        idle_secs = now_ts - last_success_ts
+        if idle_secs <= RECONNECT_SILENT_THRESHOLD_SECS:
+            logger.info(
+                f"重连静默未触发: 距上次成功推送仅 {idle_secs} 秒 "
+                f"(阈值 {RECONNECT_SILENT_THRESHOLD_SECS} 秒)。"
+            )
+            return
+
+        silent_secs = max(10, int(self.cfg.get("poll_interval", 60))) + RECONNECT_SILENT_PADDING_SECS
+        self.dispatcher.set_silent_until_ts(now_ts + silent_secs)
+        logger.warning(
+            f"检测到长时间未成功推送({idle_secs} 秒), 进入静默模式 {silent_secs} 秒。"
+        )
 
     # ==================== amagi 桥接 ====================
 
@@ -551,6 +606,16 @@ class Main(Star):
         amagi_ready = "✅ 已就绪" if bridge["built"] else "❌ 未就绪"
         bridge_err = bridge["last_error"] or bridge["build_msg"]
 
+        last_ok_ts = self.data_manager.get_last_success_sub_notify_ts()
+        last_ok = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ok_ts))
+            if last_ok_ts else "无记录"
+        )
+        if self.dispatcher.is_silent():
+            silent = f"🔇 静默中 (剩余 {self.dispatcher.silent_remaining_secs()} 秒)"
+        else:
+            silent = "🟢 正常"
+
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
@@ -558,6 +623,10 @@ class Main(Star):
             f"上次视频扫描: {listener['last_video_scan']}\n"
             f"上次直播扫描: {listener['last_live_scan']}\n"
             f"监听错误: {listener['last_error'] or '无'}\n"
+            f"{'=' * 20}\n"
+            f"推送状态: {silent}\n"
+            f"上次推送成功: {last_ok}\n"
+            f"渲染缓存: {len(self.listener._render_cache)}/{self.listener._render_cache_limit}\n"
             f"{'=' * 20}\n"
             f"Cookie: {cookie_ok}\n"
             f"轮询间隔: {self.cfg.get('poll_interval', 60)}秒\n"
