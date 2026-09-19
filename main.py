@@ -48,7 +48,7 @@ RECONNECT_SILENT_PADDING_SECS = 60
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.2.1",
+    "1.2.2",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
