@@ -398,7 +398,7 @@ class AmagiService:
             # 健康检查会被**残留进程的响应**骗过(握手成功), 于是插件每个轮询周期
             # 都白拉一个进程、日志成对刷屏、pid 一直变 —— 复用即可根治。
             if await asyncio.to_thread(self._probe, 1.0):
-                owner = await asyncio.to_thread(self._port_listener_pid)
+                owner = await asyncio.to_thread(self._port_listener_pid, self.port)
                 if self._proc and self._proc.returncode is None and (
                         owner is None or owner == self._proc.pid):
                     self._started = True
