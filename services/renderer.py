@@ -59,6 +59,9 @@ class Renderer:
         self.star = star
         self.rai = rai
         self._templates = {}
+        # 最近一次渲染结果 (供 /dy_status、/dy_img_test 诊断图片体积)
+        self.last_card_path: Optional[str] = None
+        self.last_card_size: int = 0
 
     def _load_template(self, name: str) -> Optional[str]:
         """加载 HTML 模板"""
@@ -91,6 +94,8 @@ class Renderer:
                 options=CARD_RENDER_OPTIONS,
             )
             if img_path:
+                self.last_card_path = img_path
+                self.last_card_size = self._file_size(img_path)
                 logger.info(f"卡片渲染成功: {img_path}{self._size_hint(img_path)}")
             return img_path
         except Exception as e:
@@ -98,13 +103,17 @@ class Renderer:
             return None
 
     @staticmethod
-    def _size_hint(img_path: str) -> str:
-        """渲染结果的文件大小提示 (图片体积过大是协议端推送失败的常见原因)"""
+    def _file_size(img_path: str) -> int:
         try:
-            size_kb = Path(img_path).stat().st_size / 1024
+            return Path(img_path).stat().st_size
         except OSError:
-            return ""
-        return f" ({size_kb:.0f} KB)"
+            return 0
+
+    @classmethod
+    def _size_hint(cls, img_path: str) -> str:
+        """渲染结果的文件大小提示 (图片体积过大是协议端推送失败的常见原因)"""
+        size = cls._file_size(img_path)
+        return f" ({size / 1024:.0f} KB)" if size else ""
 
     async def render_video(self, work: dict, nickname: str = "") -> Tuple[str, Optional[str]]:
         """
