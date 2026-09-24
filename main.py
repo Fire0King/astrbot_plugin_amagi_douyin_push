@@ -99,7 +99,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.3.0",
+    "1.3.1",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -1012,6 +1012,21 @@ class Main(Star):
         bili_cookie = "✅ 已配置" if self.amagi.bilibili_cookie_configured else "❌ 未配置"
         bili_subs = self.subscription_service.get_subscription_count('bilibili')
 
+        # 上游偶发失败的重试统计 / 当前仍在连续失败的订阅项 (便于判断"要不要人工介入")
+        retries = int(bridge.get("transient_retries") or 0)
+        recovered = int(bridge.get("transient_recovered") or 0)
+        if retries:
+            upstream = f"↻ 上游偶发失败已重试 {retries} 次 (恢复 {recovered} 次)"
+            if bridge.get("last_transient_error"):
+                upstream += f", 最近: {bridge['last_transient_error']}"
+        else:
+            upstream = "✅ 无 (未遇到上游偶发失败)"
+        failing = listener.get("failing_checks") or {}
+        if failing:
+            fail_line = "⚠️ " + ", ".join(f"{k}×{v}" for k, v in list(failing.items())[:3])
+        else:
+            fail_line = "✅ 无"
+
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
@@ -1019,6 +1034,7 @@ class Main(Star):
             f"上次视频扫描: {listener['last_video_scan']}\n"
             f"上次直播扫描: {listener['last_live_scan']}\n"
             f"监听错误: {listener['last_error'] or '无'}\n"
+            f"连续失败项: {fail_line}\n"
             f"{'=' * 20}\n"
             f"推送状态: {silent}\n"
             f"上次推送成功: {last_ok}\n"
@@ -1035,6 +1051,7 @@ class Main(Star):
             f"{'=' * 20}\n"
             f"amagi 桥接: {bridge_state} ({bridge['port']})\n"
             f"amagi 运行时: {amagi_ready} (v{bridge['amagi_version']})\n"
+            f"上游重试: {upstream}\n"
             f"说明: {bridge_err}"
         )
         yield event.plain_result(msg)

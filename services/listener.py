@@ -2,7 +2,7 @@ import asyncio
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.api.message_components import AtAll, File, Image, Plain
@@ -42,6 +42,21 @@ _MIN_AT_ALL_REMAINING = 1
 
 # 会话类型: 只有群聊才可能 @全体
 _GROUP_MESSAGE_TYPE = "GroupMessage"
+
+# 连续失败多少次才把日志从 WARNING 升级为 ERROR (上游偶发抖动约占 1% 的轮询)
+_FAIL_ESCALATE_AFTER = 3
+
+# 判定"上游偶发失败"的关键词: 这类失败下一轮通常就自愈, 不需要人工介入
+_TRANSIENT_HINTS = ("code=5", "抖音数据获取失败", "系统繁忙", "请求过于频繁", "timed out", "Read timed out")
+
+# 判定"可能需要人工介入(Cookie/登录)"的关键词: 连续失败时才把这些提示写给用户
+_COOKIE_HINTS = ("抖音ck", "cookie", "失效", "登录", "未登录")
+
+
+def _is_transient_error(exc: Any) -> bool:
+    """错误是否属于"上游偶发、会自动重试"的类型"""
+    text = str(exc)
+    return any(h in text for h in _TRANSIENT_HINTS)
 
 
 def _is_platform(record, platform: str) -> bool:
@@ -92,6 +107,34 @@ class DouyinListener:
         self.last_bili_live_scan_at: float = 0.0
         self.last_error: str = ""
         self._last_not_ready_log_at: float = 0.0
+        # 各订阅项的连续失败次数: 上游偶发失败只 WARNING(下一轮会自动重试),
+        # 连续 >=3 次才升级为 ERROR, 避免 1% 的抖动刷出满屏红色日志
+        self._fail_streak: Dict[str, int] = {}
+
+    # ==================== 失败/恢复日志 ====================
+
+    def _note_check_failure(self, key: str, msg: str, exc: Optional[BaseException] = None) -> None:
+        """记录一次订阅检查失败 (首次降级为 WARNING, 连续多次才 ERROR)"""
+        n = self._fail_streak.get(key, 0) + 1
+        self._fail_streak[key] = n
+        self.last_error = f"{msg} (连续第 {n} 次)"
+        text = str(exc or msg).lower()
+        if n >= _FAIL_ESCALATE_AFTER:
+            extra = ""
+            if any(h in text for h in _COOKIE_HINTS):
+                extra = " —— 上游提示可能是 Cookie 失效, 可更新 douyin_cookie 后执行 /dy_bridge_restart"
+            elif _is_transient_error(exc or msg):
+                extra = " —— 上游持续抽风中, 已自动重试; 若长时间不恢复可执行 /dy_bridge_restart"
+            logger.error(self.last_error + extra)
+        else:
+            hint = " —— 上游偶发失败, 已自动重试/下一轮会重试" if _is_transient_error(exc or msg) else ""
+            logger.warning(f"{msg}{hint}")
+
+    def _note_check_ok(self, key: str) -> None:
+        """记录一次订阅检查成功 (之前失败过则打印恢复日志)"""
+        n = self._fail_streak.pop(key, 0)
+        if n:
+            logger.info(f"已恢复正常: {key} (此前连续失败 {n} 次)")
 
     # ==================== 生命周期 ====================
 
@@ -178,6 +221,7 @@ class DouyinListener:
             "last_bili_video_scan": _ago(self.last_bili_video_scan_at),
             "last_bili_live_scan": _ago(self.last_bili_live_scan_at),
             "last_error": self.last_error,
+            "failing_checks": dict(self._fail_streak),
         }
 
     def _amagi_ready(self) -> bool:
@@ -244,6 +288,7 @@ class DouyinListener:
 
         try:
             works = await get_user_works(self.amagi, sec_uid)
+            self._note_check_ok(f"抖音视频 {sec_uid}")
             if not works:
                 logger.debug(f"用户 {sec_uid} 作品列表为空, 跳过")
                 return
@@ -310,8 +355,7 @@ class DouyinListener:
                 await self._push_video_message(sub_user, record, work)
 
         except Exception as e:
-            self.last_error = f"检查用户 {sec_uid} 视频失败: {e}"
-            logger.error(self.last_error)
+            self._note_check_failure(f"抖音视频 {sec_uid}", f"检查用户 {sec_uid} 视频失败: {e}", e)
 
     @staticmethod
     def _pick_baseline(items: list) -> tuple:
@@ -620,6 +664,7 @@ class DouyinListener:
 
         try:
             snap = await get_live_snapshot(self.amagi, sec_uid)
+            self._note_check_ok(f"抖音直播 {sec_uid}")
             if not snap:
                 return
 
@@ -677,8 +722,7 @@ class DouyinListener:
                                               extra={"avatar": snap.get("avatar", "")})
 
         except Exception as e:
-            self.last_error = f"检查直播状态失败 (sec_uid={sec_uid}): {e}"
-            logger.error(self.last_error)
+            self._note_check_failure(f"抖音直播 {sec_uid}", f"检查直播状态失败 (sec_uid={sec_uid}): {e}", e)
 
     async def _push_live_message(self, sub_user: str, record: SubscriptionRecord, is_live: bool,
                                  title: str = "", extra: Optional[dict] = None):
@@ -796,6 +840,7 @@ class DouyinListener:
 
         try:
             videos = await get_bili_user_videos(self.amagi, mid)
+            self._note_check_ok(f"B站投稿 {mid}")
             if videos is None:
                 logger.debug(f"B站 UP {mid} 动态列表获取失败, 跳过本轮")
                 return
@@ -845,8 +890,7 @@ class DouyinListener:
                 await self._push_bili_video_message(sub_user, record, video)
 
         except Exception as e:  # noqa: BLE001
-            self.last_error = f"检查B站投稿失败 (mid={mid}): {e}"
-            logger.error(self.last_error)
+            self._note_check_failure(f"B站投稿 {mid}", f"检查B站投稿失败 (mid={mid}): {e}", e)
 
     def _save_bili_baseline(self, sub_user: str, record: SubscriptionRecord,
                             videos: list, latest: dict):
@@ -924,6 +968,7 @@ class DouyinListener:
 
         try:
             snap = await get_bili_live_snapshot(self.amagi, mid)
+            self._note_check_ok(f"B站直播 {mid}")
             if not snap:
                 return
             # 状态字段缺失 → 未知, 跳过本轮(不能当作未开播, 否则会误报下播)
@@ -972,8 +1017,7 @@ class DouyinListener:
                                                    cover=snap.get("cover", ""))
 
         except Exception as e:  # noqa: BLE001
-            self.last_error = f"检查B站直播状态失败 (mid={mid}): {e}"
-            logger.error(self.last_error)
+            self._note_check_failure(f"B站直播 {mid}", f"检查B站直播状态失败 (mid={mid}): {e}", e)
 
     async def _push_bili_live_message(self, sub_user: str, record: SubscriptionRecord,
                                       is_live: bool, title: str = "", cover: str = ""):

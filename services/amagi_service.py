@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from astrbot.api import logger
@@ -159,12 +159,17 @@ class AmagiService:
         self.bilibili_cookie: str = ""
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._started: bool = False      # 是否已成功监听端口
+        self._adopted: bool = False      # 端口上的桥接是"残留进程"(不是我们拉起的子进程)
         self._build_done: bool = False   # 本轮是否已检查/安装过 amagi
         self._build_ok: bool = False
         self._build_msg: str = "尚未检查 amagi 运行时"
         self._last_err: str = ""
         self._ready_attempted_at: float = 0.0
         self._warn_cookie: bool = False
+        # 上游偶发失败的重试统计 (抖音接口实测约 1% 的轮询会返回 code=500 "抖音数据获取失败")
+        self.transient_retries: int = 0      # 触发过的重试次数
+        self.transient_recovered: int = 0    # 重试后成功的次数
+        self.last_transient_error: str = ""  # 最近一次上游偶发错误(供 /dy_status 展示)
         # 拉起桥接必须串行: 视频循环与直播循环是并发任务, 靠"3 秒时间窗"防重入并不可靠
         self._start_lock = asyncio.Lock()
 
@@ -172,7 +177,11 @@ class AmagiService:
 
     @property
     def running(self) -> bool:
-        return bool(self._proc and self._proc.returncode is None)
+        if self._proc is not None and self._proc.returncode is None:
+            return True
+        # 复用残留桥接时手上没有子进程句柄, 但端口上确实有服务在跑 —— 也算"运行中",
+        # 否则 request()/监听循环会一直认为桥接不可用(整个复用逻辑就白做了)
+        return bool(self._adopted and self._started)
 
     @property
     def started(self) -> bool:
@@ -215,6 +224,9 @@ class AmagiService:
             "amagi_version": self.amagi_version,
             "entry": str(self.amagi_entry) if self.amagi_entry else "",
             "last_error": self._last_err,
+            "transient_retries": self.transient_retries,
+            "transient_recovered": self.transient_recovered,
+            "last_transient_error": self.last_transient_error,
         }
 
     # ---------------- 定位 / 安装 amagi 运行时 ----------------
@@ -412,9 +424,11 @@ class AmagiService:
                 if self._proc and self._proc.returncode is None and (
                         owner is None or owner == self._proc.pid):
                     self._started = True
+                    self._adopted = False
                     return True
                 # 不是本次拉起的进程在监听 → 直接复用, 不再拉起注定失败的进程
                 self._started = True
+                self._adopted = True
                 self._last_err = ""
                 logger.warning(
                     f"端口 {self.port} 已有桥接在监听 (pid={owner if owner else '未知'}, "
@@ -481,6 +495,7 @@ class AmagiService:
             await self._terminate_proc()
             return False
         self._started = True
+        self._adopted = False
         self._last_err = ""
         pid = self._proc.pid if self._proc else "?"
         logger.info(f"amagi 桥接就绪: http://{self.host}:{self.port} (pid={pid})")
@@ -589,6 +604,8 @@ class AmagiService:
         return False
 
     async def _terminate_proc(self):
+        self._adopted = False
+        self._started = False
         if not self._proc:
             return
         proc = self._proc
@@ -625,6 +642,21 @@ class AmagiService:
 
     # ---------------- HTTP 调用 ----------------
 
+    # 上游偶发失败(桥接返回 code>=500)的重试间隔(秒); 设为空元组即关闭重试
+    TRANSIENT_RETRY_DELAYS: Tuple[float, ...] = (1.0, 2.5)
+
+    @classmethod
+    def _retry_delays(cls) -> Tuple[float, ...]:
+        return tuple(cls.TRANSIENT_RETRY_DELAYS or ())
+
+    @staticmethod
+    def _is_transient_code(code: Any) -> bool:
+        """桥接返回的 code 是否为"上游抽风"型(>=500); 非数字一律视为不可重试"""
+        try:
+            return int(code) >= 500
+        except (TypeError, ValueError):
+            return False
+
     @staticmethod
     def _http_get_params(url: str, params: Optional[Dict[str, Any]],
                          timeout: float = 25) -> Dict[str, Any]:
@@ -645,6 +677,11 @@ class AmagiService:
         调用 amagi 内置路由, 返回其 data 字段 (amagi 业务成功时).
 
         失败时抛出 AmagiError/AmagiAPIError.
+
+        上游偶发失败(桥接明确返回 code>=500, 例如抖音侧抽风时的
+        "抖音数据获取失败")会自动重试 1~2 次; 实测这类失败约占 1% 的轮询,
+        隔一两秒重试即可成功 —— 不重试的话这一轮订阅检查就被跳过了。
+        网络超时/连接失败不做重试(那说明桥接本身有问题, 重试只会拖长轮询周期)。
         """
         if not (self.running and self._started):
             await self.ensure_started()
@@ -652,13 +689,39 @@ class AmagiService:
             raise AmagiNotReady(f"amagi 桥接不可用: {self._last_err or self._build_msg or '未启动'}")
 
         url = f"http://{self.host}:{self.port}{path}"
-        payload = await asyncio.to_thread(self._http_get_params, url, params, timeout=25)
-        if payload.get("success") is not True:
+        delays = self._retry_delays()
+        for attempt in range(len(delays) + 1):
+            try:
+                payload = await asyncio.to_thread(self._http_get_params, url, params, timeout=25)
+            except AmagiError:
+                # 复用的残留桥接已经死了 → 让下个周期重新探测/拉起, 而不是一直"假装就绪"
+                if self._adopted:
+                    self._adopted = False
+                    self._started = False
+                raise
+            if payload.get("success") is True:
+                if attempt:
+                    self.transient_recovered += 1
+                    logger.info(f"amagi 上游偶发失败已恢复 (重试第 {attempt} 次成功): {path}")
+                data = payload.get("data")
+                if data is None:
+                    raise AmagiError(f"amagi 返回空数据: {path} {params}")
+                return data
+
             code = payload.get("code", "?")
             message = payload.get("message") or "未知错误"
             error = payload.get("error") or {}
-            raise AmagiAPIError(f"amagi 请求失败 (code={code}): {message} ({json.dumps(error, ensure_ascii=False)[:300]})")
-        data = payload.get("data")
-        if data is None:
-            raise AmagiError(f"amagi 返回空数据: {path} {params}")
-        return data
+            detail = f"amagi 请求失败 (code={code}): {message} ({json.dumps(error, ensure_ascii=False)[:300]})"
+            if self._is_transient_code(code) and attempt < len(delays):
+                delay = delays[attempt]
+                self.transient_retries += 1
+                self.last_transient_error = f"code={code}: {message}"
+                logger.warning(
+                    f"amagi 上游偶发失败, {delay:g}s 后重试 "
+                    f"(第 {attempt + 2}/{len(delays) + 1} 次): {detail}"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise AmagiAPIError(detail)
+
+        raise AmagiError(f"amagi 请求重试后仍未成功: {path} {params}")   # pragma: no cover
