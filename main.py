@@ -101,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.2",
+    "1.4.3",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):

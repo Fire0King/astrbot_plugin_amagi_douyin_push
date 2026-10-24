@@ -37,7 +37,7 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 )
 
-# 点开登录弹层的候选选择器（按实测优先级）
+# 点开登录弹层的候选选择器（按实测优先级；2026-10-24 实测 header 里这个最稳）
 _LOGIN_SELECTORS: Sequence[str] = (
     'header button:has-text("登录")',
     'button:has-text("登录")',
@@ -47,38 +47,58 @@ _LOGIN_SELECTORS: Sequence[str] = (
 # 登录成功的最低要求：浏览器上下文里出现 sessionid
 REQUIRED_COOKIE_KEYS: Tuple[str, ...] = ("sessionid",)
 
-# 抓二维码：优先登录弹层容器内的 data:image，再退化到全页方形 img/canvas
-_QR_JS = """
-() => {
-  const ok = (el) => {
-    const r = el.getBoundingClientRect();
-    return r.width >= 110 && Math.abs(r.width - r.height) < 30;
-  };
-  const fromImg = (root) => {
-    for (const el of root.querySelectorAll('img')) {
-      const src = el.src || '';
-      if (src.startsWith('data:image')) return src;
-    }
-    return '';
-  };
-  const fromCanvas = (root) => {
-    for (const c of root.querySelectorAll('canvas')) {
-      if (!ok(c)) continue;
-      try { return c.toDataURL('image/png'); } catch (e) {}
-    }
-    return '';
-  };
-  const box = document.querySelector('#douyin_login_comp_scan_code');
-  if (box) {
-    const got = fromImg(box) || fromCanvas(box);
-    if (got) return got;
-  }
-  for (const el of document.querySelectorAll('img')) {
-    if (ok(el) && (el.src || '').startsWith('data:image')) return el.src;
-  }
-  return fromCanvas(document);
+# 登录弹层里二维码所在容器。实测(2026-10-24):
+#   容器内部没有 <img>/<canvas>, 二维码是整个"弹层区域"渲染出来的;
+#   直接截这个容器截不到码, 要截它的**父级**(xpath=../..) 才有码
+#   (父级截图解码得到 https://api.amemv.com/.../douyin_scan_code_login/...)
+BOX_SELECTOR = "#douyin_login_comp_scan_code"
+QR_CAPTURE_SELECTOR = f"{BOX_SELECTOR} >> xpath=../.."
+
+# 读弹层文字(判断"已扫码/已失效")时向上找几层
+_MODAL_TEXT_JS = """
+(sel) => {
+  let el = document.querySelector(sel);
+  for (let i = 0; i < 4 && el && el.parentElement; i++) el = el.parentElement;
+  return el ? (el.innerText || '') : '';
 }
 """
+
+
+def _looks_like_qr(path: str) -> bool:
+    """粗判一张图是不是"画完的二维码"（不引入解码依赖，只用 Pillow）。
+
+    实测同一个弹层:
+      未渲染完(占位) : 黑 2% / 白 96% / 横向黑白跳变密度 ~1.4 次每行
+      画完的二维码   : 黑 17% / 白 79% / 横向黑白跳变密度 ~10.8 次每行
+    所以三个条件就能挡住"截到白板/截到半成品":
+      尺寸 >= 200、黑色占比 >= 8%、每行平均跳变 >= 4。
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            gray = im.convert("L")
+            w, h = gray.size
+            if min(w, h) < 200:
+                return False
+            px = gray.load()
+            black = total = trans = rows = 0
+            for y in range(0, h, 2):
+                prev = None
+                rows += 1
+                for x in range(0, w, 2):
+                    v = px[x, y]
+                    total += 1
+                    if v < 60:
+                        black += 1
+                    cur = v < 128
+                    if prev is not None and cur != prev:
+                        trans += 1
+                    prev = cur
+            if not total:
+                return False
+            return (black / total) >= 0.08 and (trans / max(1, rows)) >= 4
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class DouyinLoginError(Exception):
@@ -158,6 +178,10 @@ class DouyinQrLoginClient:
     browser_factory 仅供测试注入: async () -> (playwright, browser, context, page)。
     """
 
+    # 打开登录弹层的重试参数（单测里可调小，避免慢）
+    MODAL_CLICK_ATTEMPTS: int = 3
+    MODAL_WAIT_SECS: int = 15
+
     def __init__(self, timeout_secs: int = 180, headless: bool = True,
                  browser_factory: Optional[BrowserFactory] = None):
         try:
@@ -198,12 +222,8 @@ class DouyinQrLoginClient:
                 pass
             await asyncio.sleep(2)
 
-            await self._click_login(page)
-            data_url = await self._wait_qr(page)
-            if not data_url:
-                raise DouyinLoginError("没等到登录二维码（抖音页面结构可能已变化）")
-
-            self.qr_path = self._save_qr(data_url)
+            await self._open_login_modal(page)
+            self.qr_path = await self._capture_qr(page)
         except BaseException:
             await self.close()
             raise
@@ -282,6 +302,7 @@ class DouyinQrLoginClient:
                 locale="zh-CN",
                 user_agent=_USER_AGENT,
                 viewport={"width": 1366, "height": 900},
+                device_scale_factor=2,      # 截图放大 2 倍, 二维码在手机上更好扫
             )
             page = await context.new_page()
         except Exception as e:  # noqa: BLE001
@@ -295,42 +316,70 @@ class DouyinQrLoginClient:
             ) from e
         return pw, browser, context, page
 
-    @staticmethod
-    async def _click_login(page: Any) -> None:
-        for sel in _LOGIN_SELECTORS:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count():
-                    await loc.click(timeout=4000)
-                    logger.debug(f"已点击登录入口: {sel}")
-                    return
-            except Exception:  # noqa: BLE001
-                continue
-        logger.warning("没找到登录按钮，直接尝试读取二维码")
+    # ---------------- 打开弹层 / 抓二维码 ----------------
 
     @staticmethod
-    async def _wait_qr(page: Any, tries: int = 24) -> str:
-        for _ in range(max(1, tries)):
-            try:
-                data_url = await page.evaluate(_QR_JS)
-            except Exception:  # noqa: BLE001
-                data_url = ""
-            if data_url:
-                return str(data_url)
-            await asyncio.sleep(0.5)
-        return ""
-
-    @staticmethod
-    def _save_qr(data_url: str) -> str:
+    async def _modal_present(page: Any) -> bool:
         try:
-            _, b64 = str(data_url).split(",", 1)
-            raw = base64.b64decode(b64)
+            return bool(await page.evaluate("(sel) => !!document.querySelector(sel)", BOX_SELECTOR))
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _open_login_modal(self, page: Any, attempts: Optional[int] = None) -> None:
+        """把登录弹层点开。打不开就报错——绝不退化成"页面上随便找张二维码"。"""
+        attempts = self.MODAL_CLICK_ATTEMPTS if attempts is None else attempts
+        wait_secs = max(1, self.MODAL_WAIT_SECS)
+        # 等页面水合(header 里的登录按钮出现), 实测约 3s
+        try:
+            await page.wait_for_selector(_LOGIN_SELECTORS[0], timeout=25000)
         except Exception as e:  # noqa: BLE001
-            raise DouyinLoginError(f"二维码数据解析失败: {e}") from e
+            logger.debug(f"等待登录按钮超时: {e}")
+        await asyncio.sleep(2)
+
+        for i in range(max(1, attempts)):
+            if await self._modal_present(page):
+                logger.debug("登录弹层已打开")
+                return
+            try:
+                await page.locator(_LOGIN_SELECTORS[0]).first.click(timeout=6000)
+                logger.debug(f"已点击登录入口 (第 {i + 1} 次)")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"点击登录入口失败 (第 {i + 1} 次): {e}")
+            for _ in range(wait_secs):
+                if await self._modal_present(page):
+                    logger.debug(f"登录弹层已打开 (第 {i + 1} 次点击后)")
+                    return
+                await asyncio.sleep(1)
+            await asyncio.sleep(2)
+
+        raise DouyinLoginError("没能打开抖音登录弹层（页面结构可能变化），请稍后再试")
+
+    async def _capture_qr(self, page: Any, tries: int = 14) -> str:
+        """截登录弹层区域作为二维码图片（容器本身截不到码, 要截父级）。
+
+        弹层刚出现时二维码还没画完(实测 +0s 的截图解码失败), 所以这里反复截图,
+        直到 _looks_like_qr 通过为止。
+        """
         fd, path = tempfile.mkstemp(prefix="dy_login_qr_", suffix=".png")
-        with os.fdopen(fd, "wb") as f:
-            f.write(raw)
-        return path
+        os.close(fd)
+        last_err = ""
+        for i in range(max(1, tries)):
+            # 第一次多等一会儿(约 1s 后二维码才画完), 之后小步重试
+            await asyncio.sleep(1.0 if i == 0 else 0.6)
+            try:
+                loc = page.locator(QR_CAPTURE_SELECTOR).first
+                if await loc.count():
+                    await loc.screenshot(path=path)
+                    if _looks_like_qr(path):
+                        return path
+                    last_err = "截图不像完整二维码"
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)[:120]
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise DouyinLoginError(f"没截到登录二维码（{last_err or '弹层未渲染'}）")
 
     # ---------------- 扫码进度 ----------------
 
@@ -343,10 +392,16 @@ class DouyinQrLoginClient:
         if self._page is None:
             return "unknown"
         try:
-            text = await self._page.inner_text("body")
+            text = await self._page.evaluate(_MODAL_TEXT_JS, BOX_SELECTOR)
         except Exception:  # noqa: BLE001
-            return "unknown"
+            text = ""
         text = str(text or "")
+        if not text:
+            # 弹层已经消失/还没渲染: 退化为整页文字(登录成功后整页常出现"登录成功")
+            try:
+                text = await self._page.inner_text("body")
+            except Exception:  # noqa: BLE001
+                text = ""
         if any(k in text for k in ("登录成功", "已登录")):
             return "confirmed"
         if any(k in text for k in ("扫描成功", "请在手机上", "请在手机")) and "扫一扫" not in text[:60]:
@@ -356,24 +411,32 @@ class DouyinQrLoginClient:
         return "unknown"
 
     async def refresh_qr(self) -> Optional[str]:
-        """抖音侧二维码会自动刷新，这里把页面上的新二维码重新抓下来（内容没变则返回 None）。"""
+        """抖音侧二维码会自动刷新，这里重新截一张（内容没变则返回 None）。"""
         if self._page is None:
             return None
-        data_url = await self._wait_qr(self._page, tries=8)
-        if not data_url:
-            return None
-        try:
-            new_bytes = base64.b64decode(str(data_url).split(",", 1)[1])
-        except Exception:  # noqa: BLE001
-            return None
         old_path = self.qr_path
-        if old_path and os.path.exists(old_path):
+        fd, new_path = tempfile.mkstemp(prefix="dy_login_qr_", suffix=".png")
+        os.close(fd)
+        try:
+            loc = self._page.locator(QR_CAPTURE_SELECTOR).first
+            if not await loc.count():
+                os.unlink(new_path)
+                return None
+            await loc.screenshot(path=new_path)
+            if not _looks_like_qr(new_path):
+                os.unlink(new_path)
+                return None
+            if old_path and os.path.exists(old_path) and Path(old_path).read_bytes() == Path(new_path).read_bytes():
+                os.unlink(new_path)
+                return None      # 页面上的码没变（还没到刷新时机）
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"刷新二维码失败: {e}")
             try:
-                if Path(old_path).read_bytes() == new_bytes:
-                    return None      # 页面上的码没变（还没到刷新时机）
+                os.unlink(new_path)
             except OSError:
                 pass
-        new_path = self._save_qr(data_url)
+            return None
+
         self.qr_path = new_path
         if old_path and old_path != new_path:
             try:
