@@ -64,6 +64,25 @@ _MODAL_TEXT_JS = """
 """
 
 
+def _qr_signature(path: str, size: int = 16) -> Optional[Tuple[int, ...]]:
+    """把图缩成 16x16 灰度指纹，用于判断"二维码有没有换"（避免按字节比较被抗锯齿差异骗到）。"""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            small = im.convert("L").resize((size, size))
+            return tuple(small.getdata())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _signatures_differ(a: Optional[Tuple[int, ...]], b: Optional[Tuple[int, ...]],
+                       threshold: float = 6.0) -> bool:
+    """两张图的平均灰度差 >= threshold 视为"换了"（实测换码时差异远大于此）。"""
+    if not a or not b or len(a) != len(b):
+        return True
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a) >= threshold
+
+
 def _looks_like_qr(path: str) -> bool:
     """粗判一张图是不是"画完的二维码"（不引入解码依赖，只用 Pillow）。
 
@@ -334,7 +353,7 @@ class DouyinQrLoginClient:
             await page.wait_for_selector(_LOGIN_SELECTORS[0], timeout=25000)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"等待登录按钮超时: {e}")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         for i in range(max(1, attempts)):
             if await self._modal_present(page):
@@ -345,16 +364,17 @@ class DouyinQrLoginClient:
                 logger.debug(f"已点击登录入口 (第 {i + 1} 次)")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"点击登录入口失败 (第 {i + 1} 次): {e}")
-            for _ in range(wait_secs):
+            # 弹层出现实测需要几秒; 0.3s 轮询, 最多等 wait_secs 秒
+            deadline = time.time() + wait_secs
+            while time.time() < deadline:
                 if await self._modal_present(page):
                     logger.debug(f"登录弹层已打开 (第 {i + 1} 次点击后)")
                     return
-                await asyncio.sleep(1)
-            await asyncio.sleep(2)
+                await asyncio.sleep(0.3)
 
         raise DouyinLoginError("没能打开抖音登录弹层（页面结构可能变化），请稍后再试")
 
-    async def _capture_qr(self, page: Any, tries: int = 14) -> str:
+    async def _capture_qr(self, page: Any, tries: int = 16) -> str:
         """截登录弹层区域作为二维码图片（容器本身截不到码, 要截父级）。
 
         弹层刚出现时二维码还没画完(实测 +0s 的截图解码失败), 所以这里反复截图,
@@ -364,8 +384,8 @@ class DouyinQrLoginClient:
         os.close(fd)
         last_err = ""
         for i in range(max(1, tries)):
-            # 第一次多等一会儿(约 1s 后二维码才画完), 之后小步重试
-            await asyncio.sleep(1.0 if i == 0 else 0.6)
+            # 第一次稍等(约 0.8s 后二维码才画完), 之后小步重试
+            await asyncio.sleep(0.8 if i == 0 else 0.45)
             try:
                 loc = page.locator(QR_CAPTURE_SELECTOR).first
                 if await loc.count():
@@ -411,7 +431,7 @@ class DouyinQrLoginClient:
         return "unknown"
 
     async def refresh_qr(self) -> Optional[str]:
-        """抖音侧二维码会自动刷新，这里重新截一张（内容没变则返回 None）。"""
+        """抖音侧二维码约 40 秒自动换一张；这里重新截图，**按图像相似度**判断是否真的换了。"""
         if self._page is None:
             return None
         old_path = self.qr_path
@@ -426,9 +446,10 @@ class DouyinQrLoginClient:
             if not _looks_like_qr(new_path):
                 os.unlink(new_path)
                 return None
-            if old_path and os.path.exists(old_path) and Path(old_path).read_bytes() == Path(new_path).read_bytes():
+            if old_path and os.path.exists(old_path) and not _signatures_differ(
+                    _qr_signature(old_path), _qr_signature(new_path)):
                 os.unlink(new_path)
-                return None      # 页面上的码没变（还没到刷新时机）
+                return None      # 还是同一张码（截图有轻微抗锯齿差异，不算换）
         except Exception as e:  # noqa: BLE001
             logger.debug(f"刷新二维码失败: {e}")
             try:

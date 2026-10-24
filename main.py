@@ -101,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.3",
+    "1.4.4",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -1041,7 +1041,8 @@ class Main(Star):
         self._login_task = asyncio.create_task(self._run_dy_login(umo, timeout_secs))
         yield event.plain_result(
             f"⏳ 已开始扫码登录（后台执行，窗口 {timeout_secs} 秒）。\n"
-            f"二维码生成后会直接发到本会话（约 10~40 秒），收到后请**马上扫**并在手机上点「确认登录」。"
+            f"二维码生成后会直接发到本会话（约 20~60 秒）。\n"
+            f"⚠️ 抖音的码**约 1 分钟自动换一次**，收到就立刻扫；换码时我会自动补发最新的一张，以最后一张为准。"
         )
 
     def _login_busy(self) -> bool:
@@ -1050,19 +1051,22 @@ class Main(Star):
     async def _run_dy_login(self, umo: str, timeout_secs: int) -> None:
         """后台执行扫码登录（不占用命令处理流程）。
 
-        等待期间每 2 秒读一次页面状态:
-          - 扫码成功 → 立刻提示"请在手机上点确认"
-          - 抖音侧二维码失效 → 自动抓新码并重发（我们发的是静态图, 旧码会过期）
+        抖音的登录二维码约 40 秒就自动换一张，我们发出去的是截图，不补发的话
+        用户扫到时大概率已经作废（这是"扫了没反应、最后还是过期"的主因）。
+        所以等待期间: 每 ~4 秒比一次截图, 码换了就补发最新的一张;
+        另外每 2 秒读一次页面文字, 扫到就立刻提示"请在手机上点确认"。
         最后: 成功则落盘凭据 + 重启桥接 + 真机验证; 超时/异常都明确回一条消息。
         """
         client = DouyinQrLoginClient(timeout_secs=timeout_secs)
+        max_resends = 10
         try:
             qr = await client.start()
             await self._send_to(umo, MessageChain()
                                 .message(
-                                    f"📱 请用**抖音 App** 扫描下方二维码登录（{timeout_secs} 秒内有效）。\n"
-                                    f"扫到后手机上会显示「登录确认」，**点确认**即可；"
-                                    f"成功后自动保存凭据并重启桥接。"
+                                    f"📱 请用**抖音 App** 扫描下方二维码登录。\n"
+                                    f"⚠️ 抖音的码**约 1 分钟自动换一次**，收到就立刻扫；"
+                                    f"换了我会再发新的一张，以最后一张为准。\n"
+                                    f"扫到后手机上点「确认登录」，成功后自动保存凭据并重启桥接。"
                                 )
                                 .file_image(qr.image_path))
             logger.info(f"扫码登录: 二维码已发送, 开始等待扫码 (超时 {timeout_secs}s)")
@@ -1070,6 +1074,8 @@ class Main(Star):
             deadline = time.time() + timeout_secs
             scanned_notified = False
             errors = 0
+            ticks = 0
+            resends = 0
             while time.time() < deadline:
                 result = await client.poll()
                 if result.is_done:
@@ -1093,14 +1099,18 @@ class Main(Star):
                     await self._send_to(umo, MessageChain().message(
                         "📱 已扫码，请在手机上点「确认登录」。"
                     ))
-                elif state == "expired":
+
+                # 每两轮(~4s)检查一次二维码是否轮换, 变了就补发（以最新一张为准）
+                if ticks % 2 == 0 and resends < max_resends:
                     new_path = await client.refresh_qr()
                     if new_path:
+                        resends += 1
                         scanned_notified = False
-                        logger.info("扫码登录: 抖音侧二维码已刷新, 重新发送")
+                        logger.info(f"扫码登录: 二维码已轮换, 补发第 {resends} 张")
                         await self._send_to(umo, MessageChain()
-                                            .message("♻️ 这张二维码在抖音侧已失效，已自动换新码，请扫这张：")
+                                            .message("♻️ 抖音的二维码自动换了一张，请扫这张最新的（旧码已作废）：")
                                             .file_image(new_path))
+                ticks += 1
                 await asyncio.sleep(2)
 
             await self._send_to(umo, MessageChain().message(
