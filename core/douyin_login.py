@@ -195,7 +195,7 @@ class DouyinQrLoginClient:
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
             await self._click_login(page)
             data_url = await self._wait_qr(page)
@@ -307,7 +307,7 @@ class DouyinQrLoginClient:
         logger.warning("没找到登录按钮，直接尝试读取二维码")
 
     @staticmethod
-    async def _wait_qr(page: Any, tries: int = 15) -> str:
+    async def _wait_qr(page: Any, tries: int = 24) -> str:
         for _ in range(max(1, tries)):
             try:
                 data_url = await page.evaluate(_QR_JS)
@@ -315,7 +315,7 @@ class DouyinQrLoginClient:
                 data_url = ""
             if data_url:
                 return str(data_url)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
         return ""
 
     @staticmethod

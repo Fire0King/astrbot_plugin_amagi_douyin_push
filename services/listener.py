@@ -226,8 +226,17 @@ class DouyinListener:
         }
 
     def _amagi_ready(self) -> bool:
-        """桥接是否可提供服务 (Cookie 已配置且进程已就绪)"""
+        """抖音侧桥接是否可提供服务 (抖音 Cookie 已配置且进程已就绪)"""
         return bool(self.amagi.cookie_configured and self.amagi.running and self.amagi.started)
+
+    def _bridge_ready(self) -> bool:
+        """
+        B 站侧只需要桥接本身在跑。
+
+        B 站数据接口用的是 B 站凭据(自填/借用 bilibili 插件), 与抖音 Cookie 无关;
+        所以抖音 Cookie 没配时也不该把 B 站订阅/测试一起拖死。
+        """
+        return bool(self.amagi.running and self.amagi.started)
 
     def _log_not_ready(self):
         """桥接不可用时给出可见原因 (限流, 避免刷屏)"""
@@ -835,7 +844,7 @@ class DouyinListener:
             await self.amagi.ensure_started()
         except Exception as e:  # noqa: BLE001
             logger.debug(f"ensure_started 异常: {e}")
-        if not self._amagi_ready():
+        if not self._bridge_ready():
             self._log_not_ready()
             return
 
@@ -963,7 +972,7 @@ class DouyinListener:
             await self.amagi.ensure_started()
         except Exception as e:  # noqa: BLE001
             logger.debug(f"ensure_started 异常: {e}")
-        if not self._amagi_ready():
+        if not self._bridge_ready():
             self._log_not_ready()
             return
 

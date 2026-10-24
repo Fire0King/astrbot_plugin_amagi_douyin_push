@@ -101,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.0",
+    "1.4.1",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -1038,7 +1038,7 @@ class Main(Star):
         async with self._login_lock:
             client = DouyinQrLoginClient(timeout_secs=timeout_secs)
             try:
-                yield event.plain_result("⏳ 正在打开抖音登录页生成二维码（约 10 秒）...")
+                yield event.plain_result("⏳ 正在打开抖音登录页生成二维码（约 10~40 秒，请稍等）...")
                 qr = await client.start()
                 await event.send(
                     MessageChain()
@@ -1048,6 +1048,7 @@ class Main(Star):
                     )
                     .file_image(qr.image_path)
                 )
+                logger.info("扫码登录: 二维码已发送到会话, 开始等待扫码")
             except DouyinLoginError as e:
                 await client.close()
                 yield event.plain_result(f"❌ 生成二维码失败: {e}")

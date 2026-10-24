@@ -166,6 +166,7 @@ class AmagiService:
         self._last_err: str = ""
         self._ready_attempted_at: float = 0.0
         self._warn_cookie: bool = False
+        self._warn_bili_only: bool = False   # "只有 B 站凭据" 的提示只打一次
         # 上游偶发失败的重试统计 (抖音接口实测约 1% 的轮询会返回 code=500 "抖音数据获取失败")
         self.transient_retries: int = 0      # 触发过的重试次数
         self.transient_recovered: int = 0    # 重试后成功的次数
@@ -196,6 +197,11 @@ class AmagiService:
     @property
     def cookie_configured(self) -> bool:
         return bool(self.cookie)
+
+    @property
+    def any_cookie_configured(self) -> bool:
+        """任一平台凭据已配置即可拉起桥接（抖音/B 站共用同一个桥接进程）"""
+        return bool(self.cookie or self.bilibili_cookie)
 
     def set_cookie(self, cookie: str):
         self.cookie = (cookie or "").strip()
@@ -399,11 +405,19 @@ class AmagiService:
             if self.running and self._started:
                 return True
 
-            if not self.cookie_configured:
+            if not self.any_cookie_configured:
                 if not self._warn_cookie:
-                    logger.warning("抖音 Cookie 未配置 (douyin_cookie), 跳过启动 amagi 桥接")
+                    logger.warning(
+                        "抖音/B 站凭据都未配置, 跳过启动 amagi 桥接"
+                        "（抖音可让管理员发送 /dy_login 扫码登录）"
+                    )
                     self._warn_cookie = True
                 return False
+            if not self.cookie_configured:
+                # 只有 B 站凭据时也把桥接拉起来: 否则 B 站订阅/测试会被"抖音 Cookie 未配置"连带拖死
+                if not self._warn_bili_only:
+                    logger.info("抖音 Cookie 未配置, 但 B 站凭据可用 —— 桥接照常启动, 仅跳过抖音监控")
+                    self._warn_bili_only = True
 
             await self.prepare()
             if not self._build_ok:
