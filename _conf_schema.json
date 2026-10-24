@@ -65,7 +65,10 @@
     "card_engine": {
         "description": "图片卡片的渲染引擎：local=Pillow 本地自绘（不依赖任何外部渲染服务，推荐）；html=AstrBot 文转图（远程 t2i 服务，可能不稳定）",
         "type": "string",
-        "options": ["local", "html"],
+        "options": [
+            "local",
+            "html"
+        ],
         "default": "local"
     },
     "card_quality": {
@@ -106,7 +109,7 @@
     "login_timeout": {
         "description": "扫码登录（/dy_login）等待扫码的秒数，超时后二维码作废",
         "type": "int",
-        "default": 180,
+        "default": 300,
         "minimum": 60,
         "maximum": 600
     },

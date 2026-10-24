@@ -101,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.1",
+    "1.4.2",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -120,8 +120,8 @@ class Main(Star):
         self.credentials = CredentialStore()
         cookie = self._resolve_douyin_cookie()
         self.amagi.set_cookie(cookie)
-        # 扫码登录会话: 同一时间只允许一个
-        self._login_lock = asyncio.Lock()
+        # 扫码登录: 后台任务(不占用命令处理流程, 避免被上层取消), 同一时间只允许一个
+        self._login_task: Optional[asyncio.Task] = None
         # B 站凭据(附属功能): 可直接粘贴 SESSDATA=...; bili_jct=... 或整段 Cookie;
         # 留空时若开启了 enable_bilibili, 会尝试从 bilibili 插件的数据里借用
         self.enable_bilibili = bool(self.cfg.get("enable_bilibili", False))
@@ -1018,73 +1018,128 @@ class Main(Star):
     @permission_type(PermissionType.ADMIN)
     async def dy_login(self, event: AstrMessageEvent):
         """
-        扫码登录抖音（管理员）：发送二维码，用抖音 App 扫码即可自动保存 Cookie 并重启桥接。
+        扫码登录抖音（管理员）：后台出码并把二维码发到当前会话，扫完自动保存凭据并重启桥接。
 
         用法: /dy_login
         """
-        if self._login_lock.locked():
+        if self._login_busy():
             yield event.plain_result(
-                "⚠️ 已有一个扫码登录在进行中，请先扫上一张二维码，或等它过期后再试。"
+                "⚠️ 已有一个扫码登录在进行中，请先把那张二维码扫掉，或等它结束（最长 10 分钟）再试。"
             )
             return
 
-        timeout_secs = 180
+        timeout_secs = 300
         try:
-            timeout_secs = int(self.cfg.get("login_timeout", 180) or 180)
+            timeout_secs = int(self.cfg.get("login_timeout", 300) or 300)
         except (TypeError, ValueError):
-            timeout_secs = 180
+            timeout_secs = 300
         timeout_secs = max(60, min(600, timeout_secs))
 
-        async with self._login_lock:
-            client = DouyinQrLoginClient(timeout_secs=timeout_secs)
-            try:
-                yield event.plain_result("⏳ 正在打开抖音登录页生成二维码（约 10~40 秒，请稍等）...")
-                qr = await client.start()
-                await event.send(
-                    MessageChain()
-                    .message(
-                        f"📱 请用**抖音 App** 扫描下方二维码登录（{timeout_secs} 秒内有效）。\n"
-                        f"扫码后请在手机上点「确认登录」，成功后会自动保存凭据并重启桥接。"
-                    )
-                    .file_image(qr.image_path)
-                )
-                logger.info("扫码登录: 二维码已发送到会话, 开始等待扫码")
-            except DouyinLoginError as e:
-                await client.close()
-                yield event.plain_result(f"❌ 生成二维码失败: {e}")
-                return
-            except Exception as e:  # noqa: BLE001
-                await client.close()
-                logger.error(f"扫码登录启动异常: {e}")
-                yield event.plain_result(f"❌ 扫码登录启动异常: {e}")
-                return
+        umo = event.unified_msg_origin
+        # 关键: 登录过程放到后台任务里跑。命令处理流程可能被上层提前结束/取消,
+        # 而扫码需要用户 3~5 分钟, 不能依赖它活着。
+        self._login_task = asyncio.create_task(self._run_dy_login(umo, timeout_secs))
+        yield event.plain_result(
+            f"⏳ 已开始扫码登录（后台执行，窗口 {timeout_secs} 秒）。\n"
+            f"二维码生成后会直接发到本会话（约 10~40 秒），收到后请**马上扫**并在手机上点「确认登录」。"
+        )
 
-            try:
-                deadline = time.time() + timeout_secs
-                while time.time() < deadline:
-                    result = await client.poll()
-                    if result.is_done:
-                        await self._on_douyin_login_success(event, result.cookie)
+    def _login_busy(self) -> bool:
+        return bool(self._login_task and not self._login_task.done())
+
+    async def _run_dy_login(self, umo: str, timeout_secs: int) -> None:
+        """后台执行扫码登录（不占用命令处理流程）。
+
+        等待期间每 2 秒读一次页面状态:
+          - 扫码成功 → 立刻提示"请在手机上点确认"
+          - 抖音侧二维码失效 → 自动抓新码并重发（我们发的是静态图, 旧码会过期）
+        最后: 成功则落盘凭据 + 重启桥接 + 真机验证; 超时/异常都明确回一条消息。
+        """
+        client = DouyinQrLoginClient(timeout_secs=timeout_secs)
+        try:
+            qr = await client.start()
+            await self._send_to(umo, MessageChain()
+                                .message(
+                                    f"📱 请用**抖音 App** 扫描下方二维码登录（{timeout_secs} 秒内有效）。\n"
+                                    f"扫到后手机上会显示「登录确认」，**点确认**即可；"
+                                    f"成功后自动保存凭据并重启桥接。"
+                                )
+                                .file_image(qr.image_path))
+            logger.info(f"扫码登录: 二维码已发送, 开始等待扫码 (超时 {timeout_secs}s)")
+
+            deadline = time.time() + timeout_secs
+            scanned_notified = False
+            errors = 0
+            while time.time() < deadline:
+                result = await client.poll()
+                if result.is_done:
+                    await self._finish_dy_login(umo, result.cookie)
+                    return
+                if result.state == "error":
+                    errors += 1
+                    logger.warning(f"扫码登录轮询异常 (第 {errors} 次): {result.message}")
+                    if errors >= 5:
+                        await self._send_to(umo, MessageChain().message(
+                            "❌ 登录会话中断（浏览器异常），请重新发送 /dy_login。"
+                        ))
                         return
-                    if result.state == "error":
-                        logger.warning(f"扫码登录轮询异常: {result.message}")
-                    await asyncio.sleep(2)
-                yield event.plain_result(
-                    "⌛ 二维码已过期（没人扫或者没点确认）。\n"
-                    "需要的话再发一次 /dy_login 重新生成。"
-                )
-            finally:
-                await client.close()
+                else:
+                    errors = 0
 
-    async def _on_douyin_login_success(self, event: AstrMessageEvent, cookie: str) -> None:
-        """扫码成功后的收尾: 落盘凭据 → 重启桥接 → 真机验证一次 → 汇报。"""
-        nickname = ""
+                state = await client.page_state()
+                if state == "scanned" and not scanned_notified:
+                    scanned_notified = True
+                    logger.info("扫码登录: 已扫码, 等待手机确认")
+                    await self._send_to(umo, MessageChain().message(
+                        "📱 已扫码，请在手机上点「确认登录」。"
+                    ))
+                elif state == "expired":
+                    new_path = await client.refresh_qr()
+                    if new_path:
+                        scanned_notified = False
+                        logger.info("扫码登录: 抖音侧二维码已刷新, 重新发送")
+                        await self._send_to(umo, MessageChain()
+                                            .message("♻️ 这张二维码在抖音侧已失效，已自动换新码，请扫这张：")
+                                            .file_image(new_path))
+                await asyncio.sleep(2)
+
+            await self._send_to(umo, MessageChain().message(
+                "⌛ 二维码已过期（没人扫或没在手机上点确认）。\n需要的话再发一次 /dy_login。"
+            ))
+        except asyncio.CancelledError:
+            logger.info("扫码登录任务被取消（插件卸载/重载）")
+            raise
+        except DouyinLoginError as e:
+            logger.error(f"扫码登录失败: {e}")
+            await self._send_to(umo, MessageChain().message(f"❌ 扫码登录失败: {e}"))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"扫码登录异常: {e}")
+            await self._send_to(umo, MessageChain().message(f"❌ 扫码登录异常: {e}"))
+        finally:
+            # 被取消时也要尽量把浏览器收掉（shield 保证清理协程不会被同一次取消打断）
+            try:
+                await asyncio.shield(client.close())
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _send_to(self, umo: str, chain) -> bool:
+        """主动给指定会话发消息（后台任务用；不依赖 event 的生命周期）。"""
+        try:
+            ok = await self.context.send_message(umo, chain)
+            if ok is False:
+                logger.warning("主动发送消息返回 False（未找到匹配的平台?）")
+            return bool(ok)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"主动发送消息失败: {e}")
+            return False
+
+    async def _finish_dy_login(self, umo: str, cookie: str) -> None:
+        """扫码成功后: 落盘凭据 → 重启桥接 → 真机验证一次 → 汇报。"""
         try:
             self.credentials.save_cookie(cookie, source="qr_login")
         except Exception as e:  # noqa: BLE001
             logger.error(f"保存扫码凭据失败: {e}")
-            yield_msg = f"⚠️ 扫码成功，但保存凭据失败: {e}"
-            await event.send(MessageChain().message(yield_msg))
+            await self._send_to(umo, MessageChain().message(f"⚠️ 扫码成功，但保存凭据失败: {e}"))
             return
 
         self.amagi.set_cookie(cookie)
@@ -1094,28 +1149,32 @@ class Main(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"扫码后重启桥接失败: {e}")
 
-        # 真机验证: 用当前会话里任一抖音订阅的 sec_uid 探一次
-        verified = ""
+        # 真机验证: 用任一抖音订阅的 sec_uid 探一次, 顺便把昵称补进凭据文件
+        nickname, verified = "", ""
         try:
             sec_uid = self._first_douyin_sec_uid()
             if sec_uid:
                 profile = await get_user_profile(self.amagi, sec_uid)
                 if profile:
-                    user = profile.get("user") or {}
-                    nickname = str(user.get("nickname") or "")
+                    nickname = str((profile.get("user") or {}).get("nickname") or "")
+                    if nickname:
+                        try:
+                            self.credentials.save_cookie(cookie, source="qr_login", nickname=nickname)
+                        except Exception:  # noqa: BLE001
+                            pass
                     works = await get_user_works(self.amagi, sec_uid)
-                    verified = f"（{nickname or '账号'} · 取到 {len(works or [])} 条作品）"
+                    verified = f"取到 {len(works or [])} 条作品"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"扫码后验证接口失败: {e}")
 
         lines = ["✅ 抖音扫码登录成功！"]
         if nickname:
             lines.append(f"👤 账号: {nickname}")
-        lines.append(f"🔐 凭据已保存到插件数据目录（0600，配置改版也不会丢）")
+        lines.append("🔐 凭据已保存到插件数据目录（0600，改配置/升级插件都不会丢）")
         lines.append(f"🔄 桥接: {'已重启并就绪' if bridge_ok else '重启失败，请执行 /dy_bridge_restart'}")
         if verified:
             lines.append(f"🧪 接口验证: {verified}")
-        await event.send(MessageChain().message("\n".join(lines)))
+        await self._send_to(umo, MessageChain().message("\n".join(lines)))
 
     def _first_douyin_sec_uid(self) -> str:
         """取当前所有订阅里第一个抖音用户的 sec_uid（用于登录后验证接口）。"""
@@ -1205,7 +1264,7 @@ class Main(Star):
             f"{'=' * 20}\n"
             f"Cookie: {cookie_ok}\n"
             f"凭据来源: {cred_line}\n"
-            f"扫码登录: {'🔄 进行中' if self._login_lock.locked() else '输入 /dy_login 可用'}\n"
+            f"扫码登录: {'🔄 进行中' if self._login_busy() else '输入 /dy_login 可用'}\n"
             f"轮询间隔: {self.cfg.get('poll_interval', 60)}秒\n"
             f"直播监控: {'🟢 开启' if self.cfg.get('enable_live_monitor', True) else '🔴 关闭'}\n"
             f"订阅总数: {total_subs} (视频 {video_subs} / 直播 {live_subs})\n"
@@ -1226,6 +1285,13 @@ class Main(Star):
     async def terminate(self):
         """插件卸载时清理"""
         logger.info("amagi 抖音推送插件正在卸载...")
+        # 先停扫码登录任务（会顺带关掉无头浏览器、删掉二维码临时图）
+        if self._login_task and not self._login_task.done():
+            self._login_task.cancel()
+            try:
+                await self._login_task
+            except (asyncio.CancelledError, Exception):  # noqa: B014
+                pass
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
             try:

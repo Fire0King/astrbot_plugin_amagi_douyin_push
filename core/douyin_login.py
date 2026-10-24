@@ -25,6 +25,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from astrbot.api import logger
@@ -224,6 +225,13 @@ class DouyinQrLoginClient:
 
     async def close(self) -> None:
         """关闭浏览器并清理二维码临时文件（幂等）。"""
+        # 先删二维码临时文件: 即使后面 close 过程被取消/卡住, 也不留下票据残留
+        if self.qr_path:
+            try:
+                os.unlink(self.qr_path)
+            except OSError:
+                pass
+            self.qr_path = ""
         for attr in ("_context", "_browser"):
             obj = getattr(self, attr)
             if obj is not None:
@@ -239,12 +247,6 @@ class DouyinQrLoginClient:
                 pass
             self._pw = None
         self._page = None
-        if self.qr_path:
-            try:
-                os.unlink(self.qr_path)
-            except OSError:
-                pass
-            self.qr_path = ""
 
     # ---------------- 内部 ----------------
 
@@ -329,3 +331,53 @@ class DouyinQrLoginClient:
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
         return path
+
+    # ---------------- 扫码进度 ----------------
+
+    async def page_state(self) -> str:
+        """读登录弹层的文字，判断现在到了哪一步。
+
+        返回: "scanned"（已扫码待确认）/ "expired"（抖音侧二维码失效）/
+              "confirmed"（页面提示登录成功）/ "unknown"
+        """
+        if self._page is None:
+            return "unknown"
+        try:
+            text = await self._page.inner_text("body")
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        text = str(text or "")
+        if any(k in text for k in ("登录成功", "已登录")):
+            return "confirmed"
+        if any(k in text for k in ("扫描成功", "请在手机上", "请在手机")) and "扫一扫" not in text[:60]:
+            return "scanned"
+        if any(k in text for k in ("二维码已失效", "二维码已过期", "已失效", "点击刷新")):
+            return "expired"
+        return "unknown"
+
+    async def refresh_qr(self) -> Optional[str]:
+        """抖音侧二维码会自动刷新，这里把页面上的新二维码重新抓下来（内容没变则返回 None）。"""
+        if self._page is None:
+            return None
+        data_url = await self._wait_qr(self._page, tries=8)
+        if not data_url:
+            return None
+        try:
+            new_bytes = base64.b64decode(str(data_url).split(",", 1)[1])
+        except Exception:  # noqa: BLE001
+            return None
+        old_path = self.qr_path
+        if old_path and os.path.exists(old_path):
+            try:
+                if Path(old_path).read_bytes() == new_bytes:
+                    return None      # 页面上的码没变（还没到刷新时机）
+            except OSError:
+                pass
+        new_path = self._save_qr(data_url)
+        self.qr_path = new_path
+        if old_path and old_path != new_path:
+            try:
+                os.unlink(old_path)
+            except OSError:
+                pass
+        return new_path
