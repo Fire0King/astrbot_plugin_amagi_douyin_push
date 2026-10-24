@@ -15,6 +15,7 @@ from .core.bilibili import (
     get_user_videos as get_bili_user_videos,
     parse_mid,
 )
+from .core.credential_store import CredentialStore
 from .core.data_manager import DataManager
 from .core.douyin import (
     get_create_time,
@@ -23,6 +24,7 @@ from .core.douyin import (
     get_user_profile,
     get_user_works,
 )
+from .core.douyin_login import DouyinLoginError, DouyinQrLoginClient
 from .core.models import SubscriptionRecord
 from .core.utils import build_user_url, format_number, parse_sec_uid
 from .services.amagi_service import AmagiService
@@ -99,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.3.1",
+    "1.4.0",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -113,9 +115,13 @@ class Main(Star):
 
         # 2. 初始化 amagi 桥接服务
         self.amagi = AmagiService(plugin_dir, self.cfg)
-        cookie = (self.cfg.get("douyin_cookie", "").strip()
-                  or self.cfg.get("douyin_live_cookie", "").strip())
+        # 抖音凭据优先级: /dy_login 扫码保存的(plugin_data/credential.json) > 配置里的 cookie
+        # (配置在插件升级/WebUI 保存时可能被整体重写, 扫码凭据单独落盘更稳)
+        self.credentials = CredentialStore()
+        cookie = self._resolve_douyin_cookie()
         self.amagi.set_cookie(cookie)
+        # 扫码登录会话: 同一时间只允许一个
+        self._login_lock = asyncio.Lock()
         # B 站凭据(附属功能): 可直接粘贴 SESSDATA=...; bili_jct=... 或整段 Cookie;
         # 留空时若开启了 enable_bilibili, 会尝试从 bilibili 插件的数据里借用
         self.enable_bilibili = bool(self.cfg.get("enable_bilibili", False))
@@ -163,7 +169,10 @@ class Main(Star):
         self._start_listener()
 
         if not cookie:
-            logger.warning("⚠️ 抖音 Cookie 未配置, 请先在插件设置中配置 douyin_cookie")
+            logger.warning(
+                "⚠️ 抖音 Cookie 未配置 —— 请管理员在群里发送 /dy_login 扫码登录, "
+                "或在插件配置里填写 douyin_cookie"
+            )
 
     async def _on_subscription_notification_sent(self, _notification) -> None:
         """推送成功回调: 记录时间(同一秒内不重复写盘)"""
@@ -210,6 +219,32 @@ class Main(Star):
             "(SESSDATA=...; bili_jct=...; buvid3=...), 或确保 bilibili 插件已登录"
         )
         return ""
+
+    def _resolve_douyin_cookie(self) -> str:
+        """
+        取得抖音 Cookie。
+
+        优先级: 扫码登录保存的凭据(plugin_data/credential.json)
+                > 配置 douyin_cookie > 配置 douyin_live_cookie。
+
+        为什么扫码凭据优先: 配置会被 AstrBot 在升级/保存设置时整体重写,
+        2026-10-20 就发生过 douyin_cookie 被清空导致桥接不启动。
+        """
+        stored = ""
+        try:
+            stored = self.credentials.get_cookie()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"读取扫码凭据失败: {e}")
+        if stored:
+            nickname = self.credentials.nickname() or "未知"
+            source = self.credentials.source() or "qr_login"
+            logger.info(
+                f"抖音 Cookie: 使用已保存的凭据 (来源={source}, 昵称={nickname}, "
+                f"长度={len(stored)}, 不回显)"
+            )
+            return stored
+        return (self.cfg.get("douyin_cookie", "").strip()
+                or self.cfg.get("douyin_live_cookie", "").strip())
 
     def _configure_reconnect_silent(self) -> None:
         """
@@ -950,9 +985,8 @@ class Main(Star):
     @permission_type(PermissionType.ADMIN)
     async def dy_bridge_restart(self, event: AstrMessageEvent):
         """重启 amagi 数据桥接（管理员；改 Cookie 后调用，也会重新检查/安装 amagi 运行时）"""
-        # 重新读取配置中的 Cookie (兼容 AstrBot 运行期改配置)
-        cookie = (self.cfg.get("douyin_cookie", "").strip()
-                  or self.cfg.get("douyin_live_cookie", "").strip())
+        # 重新读取凭据 (扫码保存的 / 配置里的; 兼容 AstrBot 运行期改配置)
+        cookie = self._resolve_douyin_cookie()
         self.amagi.set_cookie(cookie)
         # B 站凭据(附属功能): 配置里的优先, 否则重新尝试借用 bilibili 插件的凭据
         self.enable_bilibili = bool(self.cfg.get("enable_bilibili", False))
@@ -979,6 +1013,121 @@ class Main(Star):
                 f"状态: {self.amagi.status_info().get('build_msg', '')}\n"
                 f"错误: {self.amagi.status_info().get('last_error') or '无'}"
             )
+
+    @command("dy_login")
+    @permission_type(PermissionType.ADMIN)
+    async def dy_login(self, event: AstrMessageEvent):
+        """
+        扫码登录抖音（管理员）：发送二维码，用抖音 App 扫码即可自动保存 Cookie 并重启桥接。
+
+        用法: /dy_login
+        """
+        if self._login_lock.locked():
+            yield event.plain_result(
+                "⚠️ 已有一个扫码登录在进行中，请先扫上一张二维码，或等它过期后再试。"
+            )
+            return
+
+        timeout_secs = 180
+        try:
+            timeout_secs = int(self.cfg.get("login_timeout", 180) or 180)
+        except (TypeError, ValueError):
+            timeout_secs = 180
+        timeout_secs = max(60, min(600, timeout_secs))
+
+        async with self._login_lock:
+            client = DouyinQrLoginClient(timeout_secs=timeout_secs)
+            try:
+                yield event.plain_result("⏳ 正在打开抖音登录页生成二维码（约 10 秒）...")
+                qr = await client.start()
+                await event.send(
+                    MessageChain()
+                    .message(
+                        f"📱 请用**抖音 App** 扫描下方二维码登录（{timeout_secs} 秒内有效）。\n"
+                        f"扫码后请在手机上点「确认登录」，成功后会自动保存凭据并重启桥接。"
+                    )
+                    .file_image(qr.image_path)
+                )
+            except DouyinLoginError as e:
+                await client.close()
+                yield event.plain_result(f"❌ 生成二维码失败: {e}")
+                return
+            except Exception as e:  # noqa: BLE001
+                await client.close()
+                logger.error(f"扫码登录启动异常: {e}")
+                yield event.plain_result(f"❌ 扫码登录启动异常: {e}")
+                return
+
+            try:
+                deadline = time.time() + timeout_secs
+                while time.time() < deadline:
+                    result = await client.poll()
+                    if result.is_done:
+                        await self._on_douyin_login_success(event, result.cookie)
+                        return
+                    if result.state == "error":
+                        logger.warning(f"扫码登录轮询异常: {result.message}")
+                    await asyncio.sleep(2)
+                yield event.plain_result(
+                    "⌛ 二维码已过期（没人扫或者没点确认）。\n"
+                    "需要的话再发一次 /dy_login 重新生成。"
+                )
+            finally:
+                await client.close()
+
+    async def _on_douyin_login_success(self, event: AstrMessageEvent, cookie: str) -> None:
+        """扫码成功后的收尾: 落盘凭据 → 重启桥接 → 真机验证一次 → 汇报。"""
+        nickname = ""
+        try:
+            self.credentials.save_cookie(cookie, source="qr_login")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"保存扫码凭据失败: {e}")
+            yield_msg = f"⚠️ 扫码成功，但保存凭据失败: {e}"
+            await event.send(MessageChain().message(yield_msg))
+            return
+
+        self.amagi.set_cookie(cookie)
+        bridge_ok = False
+        try:
+            bridge_ok = await self.amagi.restart()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"扫码后重启桥接失败: {e}")
+
+        # 真机验证: 用当前会话里任一抖音订阅的 sec_uid 探一次
+        verified = ""
+        try:
+            sec_uid = self._first_douyin_sec_uid()
+            if sec_uid:
+                profile = await get_user_profile(self.amagi, sec_uid)
+                if profile:
+                    user = profile.get("user") or {}
+                    nickname = str(user.get("nickname") or "")
+                    works = await get_user_works(self.amagi, sec_uid)
+                    verified = f"（{nickname or '账号'} · 取到 {len(works or [])} 条作品）"
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"扫码后验证接口失败: {e}")
+
+        lines = ["✅ 抖音扫码登录成功！"]
+        if nickname:
+            lines.append(f"👤 账号: {nickname}")
+        lines.append(f"🔐 凭据已保存到插件数据目录（0600，配置改版也不会丢）")
+        lines.append(f"🔄 桥接: {'已重启并就绪' if bridge_ok else '重启失败，请执行 /dy_bridge_restart'}")
+        if verified:
+            lines.append(f"🧪 接口验证: {verified}")
+        await event.send(MessageChain().message("\n".join(lines)))
+
+    def _first_douyin_sec_uid(self) -> str:
+        """取当前所有订阅里第一个抖音用户的 sec_uid（用于登录后验证接口）。"""
+        try:
+            for _umo, records in self.data_manager.get_all_subscriptions().items():
+                for rec in records:
+                    if getattr(rec, "platform", "douyin") == "douyin":
+                        sec = getattr(rec, "sec_uid", "") or getattr(rec, "uid", "")
+                        if sec:
+                            return str(sec)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"读取订阅找 sec_uid 失败: {e}")
+        return ""
 
     @command("dy_status")
     @permission_type(PermissionType.ADMIN)
@@ -1027,6 +1176,19 @@ class Main(Star):
         else:
             fail_line = "✅ 无"
 
+        # 凭据来源 (扫码登录保存 / 配置文件) + 扫码登录可用性
+        cred_source = self.credentials.source()
+        if self.credentials.get_cookie():
+            saved_at = self.credentials.saved_at()
+            when = time.strftime("%m-%d %H:%M", time.localtime(saved_at)) if saved_at else "时间未知"
+            cred_line = (f"扫码登录保存（{self.credentials.nickname() or '未知账号'}，"
+                         f"{when} 保存）")
+        elif self.cfg.get("douyin_cookie", "").strip() or self.cfg.get("douyin_live_cookie", "").strip():
+            cred_line = "插件配置 douyin_cookie"
+        else:
+            cred_line = "❌ 无（管理员可发送 /dy_login 扫码登录）"
+        _ = cred_source
+
         msg = (
             f"📊 插件运行状态\n"
             f"{'=' * 20}\n"
@@ -1041,6 +1203,8 @@ class Main(Star):
             f"渲染缓存: {len(self.listener._render_cache)}/{self.listener._render_cache_limit}\n"
             f"{'=' * 20}\n"
             f"Cookie: {cookie_ok}\n"
+            f"凭据来源: {cred_line}\n"
+            f"扫码登录: {'🔄 进行中' if self._login_lock.locked() else '输入 /dy_login 可用'}\n"
             f"轮询间隔: {self.cfg.get('poll_interval', 60)}秒\n"
             f"直播监控: {'🟢 开启' if self.cfg.get('enable_live_monitor', True) else '🔴 关闭'}\n"
             f"订阅总数: {total_subs} (视频 {video_subs} / 直播 {live_subs})\n"

@@ -35,6 +35,9 @@
   新投稿（自动过滤置顶旧作）与开播/下播推送，卡片为 B 站粉色风格的**本地 Pillow 自绘**；
   B 站凭据留空时会**自动借用 `astrbot_plugin_bilibili` 已保存的登录信息**，无需重复填写
 - 🧩 **amagi 数据桥接** — 插件自动拉起常驻 Node 进程运行 amagi HTTP 服务，本地调用抖音/B 站网页版接口
+- 📱 **扫码登录 `/dy_login`** — 管理员在群里直接扫码即可换 Cookie：插件用**无头 Chromium**打开抖音登录页、
+  点出登录弹层、把二维码发到会话里，你扫完自动保存凭据并重启桥接；凭据单独存插件数据目录（0600），
+  **不会被 WebUI 改配置/升级插件时重写成空值**（这正是"桥接未就绪"最常见的坑）
 
 ---
 
@@ -100,11 +103,24 @@ pip install -r requirements.txt
 
 ### 4. 配置 Cookie
 
-在 AstrBot WebUI → 插件设置 → `astrbot_plugin_amagi_douyin_push` 中填写：
+> 💡 **推荐直接扫码**：装好后在群里发 `/dy_login`（管理员），用抖音 App 扫二维码即可，不用手抄 Cookie。
+> 扫码保存的凭据优先级高于配置，也不会因为 WebUI 保存设置/升级插件被清空。
+>
+> 扫码登录需要**一次性**装好浏览器（容器内执行，可选，仅扫码用到）：
+>
+> ```bash
+> # 国内加速（实测 9.6MB/s，官方源约 0.9MB/s）
+> PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+>   python3 -m playwright install --with-deps chromium
+> ```
+>
+> 容器被重建后需要重装一次（插件更新不影响，缓存在容器内 `/root/.cache/ms-playwright`）。
+
+也可以用下面的配置项手动填 Cookie：
 
 | 配置项 | 说明 |
 |-------|------|
-| `douyin_cookie` | 抖音网页版 Cookie（必需） |
+| `douyin_cookie` | 抖音网页版 Cookie（可留空：用 `/dy_login` 扫码登录即可） |
 | `douyin_live_cookie` | 备用 Cookie（可选，留空时回退使用 `douyin_cookie`） |
 | `poll_interval` | 轮询间隔（秒），默认 60，最小 10 |
 | `enable_live_monitor` | 是否开启直播监控，默认开启 |
@@ -119,6 +135,7 @@ pip install -r requirements.txt
 | `card_scale` | 本地卡片输出倍率，默认 4 → 成品约 1616px 宽（与 B 站插件同级）；嫌大/嫌小可调 1~6 |
 | `font_path` | 本地卡片的中文字体路径，留空自动探测（容器内一般无需填写） |
 | `render_cache_limit` | 渲染结果缓存条数上限，默认 32 |
+| `login_timeout` | `/dy_login` 扫码登录等待秒数（60-600，默认 180），超时二维码作废 |
 | `reconnect_silent` | 重连静默：距上次成功推送超过 6 小时（断电/断网/长期失败）时，恢复后先静默一个轮询周期，避免积压更新一次性刷屏，默认关闭 |
 | `enable_bilibili` | **B 站订阅（附属功能）**：开启后可用 `/bili_sub` 订阅 UP 主投稿与开播，默认关闭 |
 | `bilibili_cookie` | B 站凭据：留空时自动借用 `astrbot_plugin_bilibili` 已保存的登录信息；也可手动填 `SESSDATA=xxx; bili_jct=xxx; buvid3=xxx` |
@@ -203,8 +220,9 @@ pip install -r requirements.txt
 | `/dy_clear` | 清空当前会话所有订阅（抖音 + B 站） |
 | `/dy_global_list` | 查看所有会话的订阅 |
 | `/dy_global_unsub <UMO> <UID> [bilibili]` | 删除指定会话指定用户的订阅（末尾加 `bilibili` 则删 B 站订阅） |
-| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行，会重新检查 amagi 运行时，并重新读取 B 站凭据） |
-| `/dy_status` | 查看插件与桥接运行状态（含推送状态/上次推送成功时间/渲染缓存/B 站监控与凭据状态） |
+| `/dy_bridge_restart` | 重启 amagi 桥接（改 Cookie/端口后执行，会重新检查 amagi 运行时，并重新读取抖音/ B 站凭据） |
+| `/dy_login` | **扫码登录抖音**：发二维码到当前会话，扫完自动保存凭据并重启桥接（需先装 chromium，见安装第 4 节） |
+| `/dy_status` | 查看插件与桥接运行状态（含推送状态/上次推送成功时间/渲染缓存/凭据来源/B 站监控与凭据状态） |
 
 ---
 
@@ -221,6 +239,8 @@ astrbot_plugin_amagi_douyin_push/
 │   └── server.mjs           # Node 桥接入口（启动 amagi HTTP 服务）
 ├── core/
 │   ├── douyin.py            # 抖音数据适配（profile/作品/直播快照）
+│   ├── douyin_login.py      # 扫码登录：无头浏览器出二维码 + 抓 Cookie
+│   ├── credential_store.py  # 凭据落盘（plugin_data/credential.json，0600，优先于配置）
 │   ├── bilibili.py          # B 站数据适配（投稿动态/直播状态/用户名片，附属功能）
 │   ├── models.py            # 数据模型（订阅记录带 platform 字段）
 │   ├── data_manager.py      # 数据持久化
@@ -461,10 +481,36 @@ OOM Killer 把 NapCat/AstrBot 干掉）。
 3. **可观测**：`/dy_status` 增加 `上游重试: ↻ 上游偶发失败已重试 N 次 (恢复 M 次)` 与 `连续失败项`。
 
 **什么时候才需要你出手**：如果 `/dy_status` 里 `连续失败项` 一直挂着（比如连续十几分钟都是同一个用户），
-或者重试后的报错变成了"Cookie 未配置/登录失效"，那就去更新 `douyin_cookie`，再 `/dy_bridge_restart`。
+或者重试后的报错变成了"Cookie 未配置/登录失效"，那就让管理员发一次 **`/dy_login` 扫码登录**（见 Q14）。
 
 > 顺带一提：**不会丢更新**。失败的那一轮只是跳过检查，下一轮成功时仍会拿最新作品和基线（`last_video_id` /
 > `last_video_time`）比对，该推的照推 —— 只是晚一个轮询周期。
+
+### Q14: Cookie 失效了 / 提示"桥接未就绪"怎么办？—— `/dy_login` 扫码登录
+
+**症状**：日志出现 `抖音 Cookie 未配置 (douyin_cookie), 跳过启动 amagi 桥接`，紧接着
+`amagi 桥接未就绪, 本轮跳过检查 (cookie=未配置, ...)`；或者接口持续返回
+`code=500 抖音数据获取失败`（上游提示"你的抖音 ck 可能已经失效"）。
+
+**处理**（管理员，1 分钟）：在群里发
+
+```
+/dy_login
+```
+
+插件会：用无头 Chromium 打开抖音 → 点开登录弹层 → 把二维码图片发到当前会话 →
+你**用抖音 App 扫码并在手机上点确认** → 自动保存凭据 → 重启 amagi 桥接 → 用真实接口验一次 → 回复
+`✅ 抖音扫码登录成功（昵称 · 取到 N 条作品）`。
+
+**为什么需要浏览器**：抖音的登录接口对非浏览器请求返回 JS 反爬挑战页（`__ac_` 那套），
+纯 HTTP 拿不到票据，所以必须让真浏览器过一遍。第一次用需要按"安装 → 第 4 节"装一次 chromium（约 115MB）。
+
+**凭据存在哪 / 为什么不会再丢**：扫码成功后写到
+`data/plugin_data/astrbot_plugin_amagi_douyin_push/credential.json`（权限 0600），
+**优先级高于配置项 `douyin_cookie`**。WebUI 保存设置、升级插件都不会动它；
+之前那种"配置被重写成空值导致桥接不启动"的情况不会再发生。想改回手动 Cookie：删掉这个文件即可。
+
+**二维码过期**：默认 180 秒（`login_timeout` 可调），过期就再发一次 `/dy_login`。
 
 ---
 

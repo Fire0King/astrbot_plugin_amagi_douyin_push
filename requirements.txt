@@ -1,8 +1,18 @@
 # ─── 插件 Python 依赖 ───
 requests>=2.28.0
+# 扫码登录（/dy_login）用无头浏览器抓二维码；AstrBot 镜像自带 playwright，写上是为了显式声明
+playwright>=1.40.0
 
 # ─── 说明 ───
 # 抖音数据获取全部交由 amagi (Node.js SDK)。amagi 运行时由插件自动获取:
 #   插件启动时执行 npm install @ikenxuan/amagi 到 <插件目录>/.amagi
 #   (npm 包自带构建产物 dist/*, 无需 pnpm、无需本地 build、不依赖 git 子模块)
 # Python 侧只需 requests 访问本机 amagi 桥接的 HTTP 服务。
+#
+# 扫码登录还需要浏览器本体（一次性安装，容器里执行）:
+#   python3 -m playwright install chromium
+# 国内加速（实测 9.6MB/s，官方源约 0.9MB/s）:
+#   PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright \
+#     python3 -m playwright install chromium
+# 系统依赖（Debian/Ubuntu，装不上就在容器里用 apt）:
+#   python3 -m playwright install-deps chromium

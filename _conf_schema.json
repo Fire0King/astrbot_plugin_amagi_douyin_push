@@ -1,8 +1,8 @@
 {
     "douyin_cookie": {
-        "description": "抖音网页版 Cookie（从 www.douyin.com 获取）",
+        "description": "抖音网页版 Cookie（可留空：管理员在群里发 /dy_login 扫码登录即可自动保存）",
         "type": "string",
-        "hint": "登录抖音网页版后，从浏览器开发者工具中复制完整 Cookie 字符串",
+        "hint": "扫码登录（/dy_login）保存的凭据优先于这里；也可手动粘贴完整 Cookie 字符串",
         "default": ""
     },
     "douyin_live_cookie": {
@@ -102,6 +102,13 @@
         "description": "B站监控（附属功能）：开启后可用 /bili_sub 订阅 UP 主的新投稿与开播/下播",
         "type": "bool",
         "default": false
+    },
+    "login_timeout": {
+        "description": "扫码登录（/dy_login）等待扫码的秒数，超时后二维码作废",
+        "type": "int",
+        "default": 180,
+        "minimum": 60,
+        "maximum": 600
     },
     "bilibili_cookie": {
         "description": "B站凭据（附属功能）：留空时会自动借用 bilibili 插件已保存的凭据；也可手动填 SESSDATA=xxx; bili_jct=xxx; buvid3=xxx",

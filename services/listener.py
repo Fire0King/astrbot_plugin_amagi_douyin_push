@@ -122,7 +122,8 @@ class DouyinListener:
         if n >= _FAIL_ESCALATE_AFTER:
             extra = ""
             if any(h in text for h in _COOKIE_HINTS):
-                extra = " —— 上游提示可能是 Cookie 失效, 可更新 douyin_cookie 后执行 /dy_bridge_restart"
+                extra = (" —— 上游提示可能是 Cookie 失效, 管理员可发送 /dy_login 扫码重新登录"
+                         "（或更新 douyin_cookie 后 /dy_bridge_restart）")
             elif _is_transient_error(exc or msg):
                 extra = " —— 上游持续抽风中, 已自动重试; 若长时间不恢复可执行 /dy_bridge_restart"
             logger.error(self.last_error + extra)
