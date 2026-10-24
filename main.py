@@ -101,7 +101,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.4",
+    "1.4.5",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -1079,12 +1079,14 @@ class Main(Star):
             while time.time() < deadline:
                 result = await client.poll()
                 if result.is_done:
+                    self._log_login_events(client, "成功")
                     await self._finish_dy_login(umo, result.cookie)
                     return
                 if result.state == "error":
                     errors += 1
                     logger.warning(f"扫码登录轮询异常 (第 {errors} 次): {result.message}")
                     if errors >= 5:
+                        self._log_login_events(client, "浏览器异常")
                         await self._send_to(umo, MessageChain().message(
                             "❌ 登录会话中断（浏览器异常），请重新发送 /dy_login。"
                         ))
@@ -1113,17 +1115,21 @@ class Main(Star):
                 ticks += 1
                 await asyncio.sleep(2)
 
+            self._log_login_events(client, "到期")
             await self._send_to(umo, MessageChain().message(
                 "⌛ 二维码已过期（没人扫或没在手机上点确认）。\n需要的话再发一次 /dy_login。"
             ))
         except asyncio.CancelledError:
             logger.info("扫码登录任务被取消（插件卸载/重载）")
+            self._log_login_events(client, "被取消")
             raise
         except DouyinLoginError as e:
             logger.error(f"扫码登录失败: {e}")
+            self._log_login_events(client, "失败")
             await self._send_to(umo, MessageChain().message(f"❌ 扫码登录失败: {e}"))
         except Exception as e:  # noqa: BLE001
             logger.error(f"扫码登录异常: {e}")
+            self._log_login_events(client, "异常")
             await self._send_to(umo, MessageChain().message(f"❌ 扫码登录异常: {e}"))
         finally:
             # 被取消时也要尽量把浏览器收掉（shield 保证清理协程不会被同一次取消打断）
@@ -1131,6 +1137,18 @@ class Main(Star):
                 await asyncio.shield(client.close())
             except Exception:  # noqa: BLE001
                 pass
+
+    @staticmethod
+    def _log_login_events(client, tag: str) -> None:
+        """把本次登录的网络/导航事件回放到日志里（扫码失败时定位用）。"""
+        try:
+            events = client.recent_events(40)
+        except Exception:  # noqa: BLE001
+            events = []
+        if not events:
+            logger.info(f"扫码登录[{tag}] 事件回放: (无)")
+            return
+        logger.info(f"扫码登录[{tag}] 事件回放 ({len(events)} 条):\n  " + "\n  ".join(events))
 
     async def _send_to(self, umo: str, chain) -> bool:
         """主动给指定会话发消息（后台任务用；不依赖 event 的生命周期）。"""

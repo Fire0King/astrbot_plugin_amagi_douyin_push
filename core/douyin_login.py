@@ -216,6 +216,80 @@ class DouyinQrLoginClient:
         self._page: Any = None
         self.started_at: float = 0.0
         self.qr_path: str = ""
+        # 诊断事件（导航/登录相关请求/Set-Cookie/cookie 变化），扫码失败时打出来定位
+        self._events: List[str] = []
+        self._last_cookie_names: Tuple[str, ...] = ()
+        self._seen_reqs: int = 0
+
+    # ---------------- 诊断 ----------------
+
+    def _note(self, msg: str) -> None:
+        entry = f"{time.strftime('%H:%M:%S')} {msg}"
+        self._events.append(entry)
+        self._events = self._events[-300:]
+        logger.info(f"扫码登录事件 | {msg}")
+
+    def recent_events(self, limit: int = 40) -> List[str]:
+        return self._events[-limit:]
+
+    @staticmethod
+    def _interesting_url(url: str) -> bool:
+        low = (url or "").lower()
+        keys = ("passport", "login", "scan", "qrcode", "check_qr", "sso", "user_info", "ticket")
+        return any(k in low for k in keys)
+
+    def _attach_diagnostics(self, context: Any, page: Any) -> None:
+        """挂上网络/导航监听（失败不影响主流程）。"""
+        try:
+            page.on("framenavigated", self._on_navigated)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            context.on("request", self._on_request)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            context.on("response", self._on_response)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            context.on("page", lambda p: self._note(f"新开页面 {str(getattr(p, 'url', ''))[:70]}"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_navigated(self, frame: Any) -> None:
+        try:
+            if getattr(self, "_page", None) is not None and frame == self._page.main_frame:
+                self._note(f"页面跳转 -> {str(frame.url)[:90]}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_request(self, request: Any) -> None:
+        try:
+            url = str(request.url)
+            if not self._interesting_url(url):
+                return
+            self._seen_reqs += 1
+            if self._seen_reqs <= 40:      # 防止刷爆日志
+                self._note(f"请求 {request.method} {url[:110]}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            headers = response.headers or {}
+            set_cookie = headers.get("set-cookie") or ""
+            if "douyin" in str(response.url).lower() or "passport" in str(response.url).lower():
+                if set_cookie:
+                    names = ",".join(
+                        part.split("=", 1)[0].strip()
+                        for part in set_cookie.split("\n") if "=" in part
+                    )
+                    self._note(f"响应带 Set-Cookie: {names[:80]} <- {str(response.url)[:70]}")
+                elif "sessionid" in str(getattr(response, "url", "")):
+                    self._note(f"响应 {response.status} <- {str(response.url)[:80]}")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------------- 生命周期 ----------------
 
@@ -230,6 +304,7 @@ class DouyinQrLoginClient:
 
         self._pw, self._browser, self._context, self._page = await self._open_browser()
         page = self._page
+        self._attach_diagnostics(self._context, page)
         try:
             try:
                 await page.goto(HOME_URL, wait_until="commit", timeout=60000)
@@ -260,6 +335,11 @@ class DouyinQrLoginClient:
         except Exception as e:  # noqa: BLE001
             return LoginPollResult(state="error", message=f"读取浏览器 Cookie 失败: {e}")
         cookies = filter_douyin_cookies(raw)
+        names = tuple(sorted(cookies))
+        if names != self._last_cookie_names:
+            added = [n for n in names if n not in self._last_cookie_names]
+            self._note(f"cookie 变化: {len(self._last_cookie_names)} -> {len(names)} 新增={added[:6]}")
+            self._last_cookie_names = names
         return build_login_result(cookies, time.time() - self.started_at, self.timeout_secs)
 
     async def close(self) -> None:
