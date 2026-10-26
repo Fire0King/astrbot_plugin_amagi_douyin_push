@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from inspect import isawaitable
@@ -68,15 +69,35 @@ class SubscriptionNotificationDispatcher:
             return DispatchResult(sent=False, dropped=True, reason="silent_mode")
 
         chain = MessageChain(chain=list(notification.chain_parts)).use_t2i(False)
-        try:
-            await self.context.send_message(notification.sub_user, chain)
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                f"发送订阅通知失败: sub_user={notification.sub_user} "
-                f"category={notification.category} content_id={notification.content_id} "
-                f"error={e}"
+        ok: Any = None
+        for attempt in range(2):
+            try:
+                ok = await self.context.send_message(notification.sub_user, chain)
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    f"发送订阅通知失败: sub_user={notification.sub_user} "
+                    f"category={notification.category} content_id={notification.content_id} "
+                    f"error={e!r}"
+                )
+                return DispatchResult(sent=False, reason=str(e) or type(e).__name__)
+
+            if ok is not False:
+                break
+            # 平台还没连上时 send_message 会返回 False（不抛异常），
+            # 最常见于刚重启、平台适配器尚未就绪 —— 等几秒重试一次
+            if attempt == 0:
+                logger.warning(
+                    f"平台未就绪, 3 秒后重试发送: sub_user={notification.sub_user} "
+                    f"category={notification.category}"
+                )
+                await asyncio.sleep(3)
+
+        if ok is False:
+            logger.warning(
+                f"发送订阅通知未送达(平台未就绪?): sub_user={notification.sub_user} "
+                f"category={notification.category} content_id={notification.content_id}"
             )
-            return DispatchResult(sent=False, reason=str(e))
+            return DispatchResult(sent=False, reason="platform_not_ready")
 
         await self._on_sent(notification)
         return DispatchResult(sent=True)

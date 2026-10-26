@@ -37,9 +37,9 @@
     },
     "amagi_version": {
         "description": "amagi 版本（npm 包 @ikenxuan/amagi 的版本号，留空使用插件内置默认值）",
-        "hint": "默认 6.6.0；一般无需修改",
+        "hint": "默认 7.0.0-beta.10。注意：6.6.0 的抖音作品列表签名已失效（主页能取、作品列表返回空），表现为“抖音数据获取失败 / Cookie 可能失效”；改了版本后插件会自动重装",
         "type": "string",
-        "default": "6.6.0"
+        "default": "7.0.0-beta.10"
     },
     "npm_registry": {
         "description": "npm 源（用于自动安装 amagi，国内建议使用 npmmirror）",

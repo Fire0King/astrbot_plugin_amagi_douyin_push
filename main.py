@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,7 @@ from .core.bilibili import (
     get_user_videos as get_bili_user_videos,
     parse_mid,
 )
+from .core.cookie_utils import normalize_cookie
 from .core.credential_store import CredentialStore
 from .core.data_manager import DataManager
 from .core.douyin import (
@@ -101,7 +103,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.5",
+    "1.4.6",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -242,9 +244,10 @@ class Main(Star):
                 f"抖音 Cookie: 使用已保存的凭据 (来源={source}, 昵称={nickname}, "
                 f"长度={len(stored)}, 不回显)"
             )
-            return stored
-        return (self.cfg.get("douyin_cookie", "").strip()
-                or self.cfg.get("douyin_live_cookie", "").strip())
+            return normalize_cookie(stored)
+        raw = (self.cfg.get("douyin_cookie", "").strip()
+               or self.cfg.get("douyin_live_cookie", "").strip())
+        return normalize_cookie(raw)
 
     def _configure_reconnect_silent(self) -> None:
         """

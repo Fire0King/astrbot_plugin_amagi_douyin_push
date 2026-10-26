@@ -53,9 +53,15 @@ _ENTRY_REL_CANDIDATES = (
     Path("dist", "default", "index.cjs"),
 )
 
-# npm 包名与默认版本 (版本与 amagi 6.x 的 dist 入口结构对应)
+# npm 包名与默认版本
+# 注意: 抖音接口签名会随版本失效 —— 实测 @ikenxuan/amagi@6.6.0 的用户作品列表接口
+#       已取不到数据(返回为空, 报"抖音数据获取失败"), 而 7.0.0-beta.10 正常。
+#       旧版本的典型表现: 用户主页能取、作品列表为空/失败, 看起来像"Cookie 失效"。
 _AMAGI_PKG = "@ikenxuan/amagi"
-_DEFAULT_AMAGI_VERSION = "6.6.0"
+_DEFAULT_AMAGI_VERSION = "7.0.0-beta.10"
+
+# 已知"抖音作品列表签名失效"的版本：老配置里常见，命中则自动换默认版本
+_BROKEN_AMAGI_VERSIONS = frozenset({"6.6.0"})
 # 默认 registry: 国内可直连的 npmmirror (官方源在国内常被阻断)
 _DEFAULT_REGISTRY = "https://registry.npmmirror.com"
 
@@ -143,7 +149,16 @@ class AmagiService:
         self.port = int(cfg.get("amagi_port", 48211) or 48211)
 
         # amagi 版本 (留空用默认) 与 npm 源 (留空用 npmmirror)
-        self.amagi_version = str(cfg.get("amagi_version") or "").strip() or _DEFAULT_AMAGI_VERSION
+        configured_version = str(cfg.get("amagi_version") or "").strip()
+        if configured_version in _BROKEN_AMAGI_VERSIONS:
+            # 老配置里普遍写死了 6.6.0（当年是插件默认值），而 6.6.0 的抖音作品列表
+            # 签名已失效。这里自动纠正，避免老用户升级插件后仍然取不到数据。
+            logger.warning(
+                f"配置里的 amagi 版本 {configured_version} 的抖音作品列表签名已失效，"
+                f"自动改用 {_DEFAULT_AMAGI_VERSION}"
+            )
+            configured_version = ""
+        self.amagi_version = configured_version or _DEFAULT_AMAGI_VERSION
         self.npm_registry = str(cfg.get("npm_registry") or "").strip() or _DEFAULT_REGISTRY
 
         # 数据/日志目录 (AstrBot 标准数据目录)
@@ -245,6 +260,15 @@ class AmagiService:
                 return path
         return None
 
+    def _installed_version(self) -> str:
+        """读取已安装的 amagi 版本（读不到返回空串）"""
+        pkg = self.amagi_dir / "node_modules" / _AMAGI_PKG / "package.json"
+        try:
+            with open(pkg, "r", encoding="utf-8") as fp:
+                return str(json.load(fp).get("version") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _npm_available(self) -> bool:
         return bool(self.npm_bin) and (
             os.path.isfile(self.npm_bin) or bool(shutil.which(self.npm_bin))
@@ -280,12 +304,22 @@ class AmagiService:
         """
         entry = self._locate_entry()
         if entry:
-            self.amagi_entry = entry
-            self._build_ok = True
-            if not self._build_msg.startswith("amagi 已安装"):
-                self._build_msg = "amagi 运行时已就绪"
-            logger.info(f"amagi 运行时已就绪: {entry}")
-            return True
+            installed = self._installed_version()
+            if installed and installed != self.amagi_version:
+                # 抖音接口签名会随版本失效: 6.6.0 起"作品列表"就取不到数据(返回为空),
+                # 主页接口却还正常 —— 表现为"Cookie 没失效但一直报抖音数据获取失败"。
+                logger.warning(
+                    f"amagi 版本需要更新: 已安装 {installed}, 目标 {self.amagi_version} —— 重新安装。"
+                    f"(旧版本的抖音签名可能已失效, 常见表现: 用户主页能取、作品列表为空/失败)"
+                )
+                entry = None
+            else:
+                self.amagi_entry = entry
+                self._build_ok = True
+                if not self._build_msg.startswith("amagi 已安装"):
+                    self._build_msg = "amagi 运行时已就绪"
+                logger.info(f"amagi 运行时已就绪: {entry}")
+                return True
 
         logger.info(
             f"未找到 amagi 运行时 ({self.amagi_dir}), 将执行 "
