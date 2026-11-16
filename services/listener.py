@@ -607,6 +607,7 @@ class DouyinListener:
             at_all = await self._check_atall_permission(sub_user, bool(record.at_all))
 
             if img_path:
+                # 降级链一起交给发送器: 延迟推送时由它自己在图片失败后改发纯文本
                 result = await self.dispatcher.publish(SubscriptionNotification(
                     sub_user=sub_user,
                     chain_parts=self._build_image_chain(
@@ -614,17 +615,8 @@ class DouyinListener:
                     ),
                     category="video",
                     content_id=aweme_id,
+                    fallback_chain_parts=self._build_text_chain(at_all, text, cover),
                 ))
-                if not result.sent and not result.dropped:
-                    # 图片这一步失败(如协议端富媒体上传失败)时, 图与链接在同一条消息里,
-                    # 整条推送都会丢, 因此降级重发「纯文本 + 抖音封面原图」
-                    logger.warning(f"视频图片推送失败, 降级重发: {result.reason}")
-                    result = await self.dispatcher.publish(SubscriptionNotification(
-                        sub_user=sub_user,
-                        chain_parts=self._build_text_chain(at_all, text, cover),
-                        category="video",
-                        content_id=aweme_id,
-                    ))
             else:
                 result = await self.dispatcher.publish(SubscriptionNotification(
                     sub_user=sub_user,
@@ -635,6 +627,10 @@ class DouyinListener:
 
             if result.sent:
                 logger.info(f"已向 {sub_user} 推送视频: {aweme_id}")
+            elif result.queued:
+                logger.info(
+                    f"视频 {aweme_id} 已排入延迟队列({result.reason}), 稍后推送至 {sub_user}"
+                )
             elif result.dropped:
                 logger.info(f"静默期, 跳过推送视频 {aweme_id} ({result.reason})")
             else:
@@ -768,15 +764,8 @@ class DouyinListener:
                     ),
                     category="live",
                     content_id=str(record.sec_uid or record.uid),
+                    fallback_chain_parts=self._build_text_chain(at_all, text, avatar),
                 ))
-                if not result.sent and not result.dropped:
-                    logger.warning(f"直播图片推送失败, 降级重发: {result.reason}")
-                    result = await self.dispatcher.publish(SubscriptionNotification(
-                        sub_user=sub_user,
-                        chain_parts=self._build_text_chain(at_all, text, avatar),
-                        category="live",
-                        content_id=str(record.sec_uid or record.uid),
-                    ))
             else:
                 result = await self.dispatcher.publish(SubscriptionNotification(
                     sub_user=sub_user,
@@ -788,6 +777,8 @@ class DouyinListener:
             state = "开播" if is_live else "下播"
             if result.sent:
                 logger.info(f"已向 {sub_user} 推送直播状态: {state}")
+            elif result.queued:
+                logger.info(f"直播状态({state})已排入延迟队列({result.reason}), 稍后推送至 {sub_user}")
             elif result.dropped:
                 logger.info(f"静默期, 跳过直播状态推送: {state} ({result.reason})")
             else:
@@ -952,24 +943,28 @@ class DouyinListener:
                     ),
                     category="video",
                     content_id=content_id,
+                    fallback_chain_parts=self._build_text_chain(at_all, text, cover),
                 ))
-                if not result.sent and not result.dropped:
-                    logger.warning(f"B站视频图片推送失败, 降级重发: {result.reason}")
-                    await self.dispatcher.publish(SubscriptionNotification(
-                        sub_user=sub_user,
-                        chain_parts=self._build_text_chain(at_all, text, cover),
-                        category="video",
-                        content_id=content_id,
-                    ))
             else:
-                await self.dispatcher.publish(SubscriptionNotification(
+                result = await self.dispatcher.publish(SubscriptionNotification(
                     sub_user=sub_user,
                     chain_parts=self._build_text_chain(at_all, text, cover),
                     category="video",
                     content_id=content_id,
                 ))
 
-            logger.info(f"已向 {sub_user} 推送B站投稿: {video.get('bvid')}")
+            if result.sent:
+                logger.info(f"已向 {sub_user} 推送B站投稿: {video.get('bvid')}")
+            elif result.queued:
+                logger.info(
+                    f"B站投稿 {video.get('bvid')} 已排入延迟队列({result.reason}), 稍后推送至 {sub_user}"
+                )
+            elif result.dropped:
+                logger.info(f"静默期, 跳过推送B站投稿 {video.get('bvid')} ({result.reason})")
+            else:
+                logger.warning(
+                    f"B站投稿 {video.get('bvid')} 未送达 {sub_user}: {result.reason or '未知原因'}"
+                )
         except Exception as e:  # noqa: BLE001
             logger.error(f"推送B站投稿消息失败: {e}")
 
@@ -1076,24 +1071,27 @@ class DouyinListener:
                     ),
                     category="live",
                     content_id=str(record.uid),
+                    fallback_chain_parts=self._build_text_chain(at_all, text, cover or avatar),
                 ))
-                if not result.sent and not result.dropped:
-                    logger.warning(f"B站直播图片推送失败, 降级重发: {result.reason}")
-                    await self.dispatcher.publish(SubscriptionNotification(
-                        sub_user=sub_user,
-                        chain_parts=self._build_text_chain(at_all, text, cover or avatar),
-                        category="live",
-                        content_id=str(record.uid),
-                    ))
             else:
-                await self.dispatcher.publish(SubscriptionNotification(
+                result = await self.dispatcher.publish(SubscriptionNotification(
                     sub_user=sub_user,
                     chain_parts=self._build_text_chain(at_all, text, cover or avatar),
                     category="live",
                     content_id=str(record.uid),
                 ))
 
-            logger.info(f"已向 {sub_user} 推送B站直播状态: {'开播' if is_live else '下播'}")
+            state = "开播" if is_live else "下播"
+            if result.sent:
+                logger.info(f"已向 {sub_user} 推送B站直播状态: {state}")
+            elif result.queued:
+                logger.info(f"B站直播状态({state})已排入延迟队列({result.reason}), 稍后推送至 {sub_user}")
+            elif result.dropped:
+                logger.info(f"静默期, 跳过B站直播状态推送: {state} ({result.reason})")
+            else:
+                logger.warning(
+                    f"B站直播状态未送达 {sub_user}: {state}, 原因 {result.reason or '未知'}"
+                )
         except Exception as e:  # noqa: BLE001
             self.last_error = f"推送B站直播消息失败: {e}"
             logger.error(self.last_error)

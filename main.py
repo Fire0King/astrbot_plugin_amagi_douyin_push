@@ -103,7 +103,7 @@ def _extract_bili_cookie_from_file(path: Path) -> str:
     "astrbot_plugin_amagi_douyin_push",
     "Fire_King",
     "基于 amagi 的抖音视频更新与直播上下播推送插件",
-    "1.4.6",
+    "1.4.7",
     "https://github.com/Fire0King/astrbot_plugin_amagi_douyin_push"
 )
 class Main(Star):
@@ -148,6 +148,12 @@ class Main(Star):
         self.dispatcher = SubscriptionNotificationDispatcher(
             context=self.context,
             on_sent=self._on_subscription_notification_sent,
+        )
+        # 推送延迟: 可分别给私聊/群聊设置(例如群聊延迟 5 分钟, 私聊立即推)
+        self.dispatcher.set_delays(
+            private_secs=self.cfg.get("push_delay_private", 0),
+            group_secs=self.cfg.get("push_delay_group", 0),
+            live_ignore_delay=bool(self.cfg.get("live_ignore_delay", True)),
         )
 
         # 6. 初始化监听服务
@@ -1290,6 +1296,9 @@ class Main(Star):
             f"连续失败项: {fail_line}\n"
             f"{'=' * 20}\n"
             f"推送状态: {silent}\n"
+            f"推送延迟: 私聊 {self.dispatcher.delay_private:.0f}s / 群聊 {self.dispatcher.delay_group:.0f}s"
+            f"（{'直播不受影响' if self.dispatcher.live_ignore_delay else '直播同样延迟'}；"
+            f"排队中 {self.dispatcher.pending_count()} 条）\n"
             f"上次推送成功: {last_ok}\n"
             f"渲染缓存: {len(self.listener._render_cache)}/{self.listener._render_cache_limit}\n"
             f"{'=' * 20}\n"
@@ -1331,6 +1340,11 @@ class Main(Star):
                 pass
         if hasattr(self, 'listener'):
             await self.listener.stop()
+        # 取消所有排队中的延迟推送(重启后不会再补发)
+        if hasattr(self, 'dispatcher'):
+            cancelled = self.dispatcher.cancel_pending()
+            if cancelled:
+                logger.info(f"已取消 {cancelled} 条排队中的延迟推送")
         # 停止 amagi 桥接进程
         if hasattr(self, 'amagi'):
             try:

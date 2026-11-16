@@ -101,6 +101,27 @@
         "type": "bool",
         "default": false
     },
+    "push_delay_private": {
+        "description": "私聊推送延迟（秒）：0=收到就推；例如 60 = 私聊发现新内容后延迟 1 分钟再推",
+        "hint": "只影响私聊会话；与群聊延迟互不影响",
+        "type": "int",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 3600
+    },
+    "push_delay_group": {
+        "description": "群聊推送延迟（秒）：0=收到就推；例如 300 = 群聊延迟 5 分钟再推（私聊不受影响）",
+        "hint": "延迟期间消息在后台排队，不会阻塞下一轮扫描；重启/重载插件会丢弃仍在排队的推送",
+        "type": "int",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 3600
+    },
+    "live_ignore_delay": {
+        "description": "直播开播/下播通知忽略上面的延迟（推荐开启：开播晚几分钟就没意义了）",
+        "type": "bool",
+        "default": true
+    },
     "enable_bilibili": {
         "description": "B站监控（附属功能）：开启后可用 /bili_sub 订阅 UP 主的新投稿与开播/下播",
         "type": "bool",
